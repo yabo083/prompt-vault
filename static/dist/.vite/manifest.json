@@ -1,0 +1,134 @@
+{
+  "../node_modules/@fontsource-variable/geist/files/geist-cyrillic-wght-normal.woff2": {
+    "file": "assets/geist-cyrillic-wght-normal.woff2",
+    "src": "../node_modules/@fontsource-variable/geist/files/geist-cyrillic-wght-normal.woff2"
+  },
+  "../node_modules/@fontsource-variable/geist/files/geist-latin-ext-wght-normal.woff2": {
+    "file": "assets/geist-latin-ext-wght-normal.woff2",
+    "src": "../node_modules/@fontsource-variable/geist/files/geist-latin-ext-wght-normal.woff2"
+  },
+  "../node_modules/@fontsource-variable/geist/files/geist-latin-wght-normal.woff2": {
+    "file": "assets/geist-latin-wght-normal.woff2",
+    "src": "../node_modules/@fontsource-variable/geist/files/geist-latin-wght-normal.woff2"
+  },
+  "_app-vendor-DO-8UPp_.js": {
+    "file": "assets/app-vendor-DO-8UPp_.js",
+    "name": "app-vendor",
+    "imports": [
+      "_react-runtime-CVWkU7n2.js"
+    ]
+  },
+  "_graph-components-Dui6IPh7.js": {
+    "file": "assets/graph-components-Dui6IPh7.js",
+    "name": "graph-components",
+    "imports": [
+      "_graph-renderer-Bwdywt9k.js",
+      "_graph-utils-DBtFyWRq.js",
+      "_react-runtime-CVWkU7n2.js"
+    ]
+  },
+  "_graph-core-D8yHQfLJ.js": {
+    "file": "assets/graph-core-D8yHQfLJ.js",
+    "name": "graph-core",
+    "imports": [
+      "_graph-renderer-Bwdywt9k.js",
+      "_graph-utils-DBtFyWRq.js",
+      "_graph-layout-CoMTpAh8.js",
+      "_graph-components-Dui6IPh7.js"
+    ]
+  },
+  "_graph-layout-CoMTpAh8.js": {
+    "file": "assets/graph-layout-CoMTpAh8.js",
+    "name": "graph-layout"
+  },
+  "_graph-react-D46h3tVE.js": {
+    "file": "assets/graph-react-D46h3tVE.js",
+    "name": "graph-react",
+    "imports": [
+      "_graph-core-D8yHQfLJ.js",
+      "_graph-renderer-Bwdywt9k.js",
+      "_react-runtime-CVWkU7n2.js"
+    ],
+    "dynamicImports": [
+      "_react-runtime-CVWkU7n2.js"
+    ]
+  },
+  "_graph-renderer-Bwdywt9k.js": {
+    "file": "assets/graph-renderer-Bwdywt9k.js",
+    "name": "graph-renderer",
+    "imports": [
+      "_graph-utils-DBtFyWRq.js",
+      "_react-runtime-CVWkU7n2.js"
+    ]
+  },
+  "_graph-utils-DBtFyWRq.js": {
+    "file": "assets/graph-utils-DBtFyWRq.js",
+    "name": "graph-utils"
+  },
+  "_monaco-BcGYlSEi.js": {
+    "file": "assets/monaco-BcGYlSEi.js",
+    "name": "monaco",
+    "imports": [
+      "_react-runtime-CVWkU7n2.js"
+    ]
+  },
+  "_motion-BVmGZf68.js": {
+    "file": "assets/motion-BVmGZf68.js",
+    "name": "motion",
+    "imports": [
+      "_react-runtime-CVWkU7n2.js"
+    ]
+  },
+  "_react-runtime-CVWkU7n2.js": {
+    "file": "assets/react-runtime-CVWkU7n2.js",
+    "name": "react-runtime",
+    "isDynamicEntry": true
+  },
+  "_ui-primitives-Dr8-7HNn.js": {
+    "file": "assets/ui-primitives-Dr8-7HNn.js",
+    "name": "ui-primitives",
+    "imports": [
+      "_react-runtime-CVWkU7n2.js",
+      "_graph-utils-DBtFyWRq.js"
+    ]
+  },
+  "index.html": {
+    "file": "assets/prompt-vault.js",
+    "name": "index",
+    "src": "index.html",
+    "isEntry": true,
+    "imports": [
+      "_react-runtime-CVWkU7n2.js",
+      "_app-vendor-DO-8UPp_.js",
+      "_ui-primitives-Dr8-7HNn.js",
+      "_graph-react-D46h3tVE.js",
+      "_graph-core-D8yHQfLJ.js",
+      "_graph-renderer-Bwdywt9k.js",
+      "_motion-BVmGZf68.js",
+      "_graph-utils-DBtFyWRq.js",
+      "_graph-layout-CoMTpAh8.js",
+      "_graph-components-Dui6IPh7.js"
+    ],
+    "dynamicImports": [
+      "src/ComparatorDiff.tsx"
+    ],
+    "css": [
+      "assets/index.css"
+    ],
+    "assets": [
+      "assets/geist-cyrillic-wght-normal.woff2",
+      "assets/geist-latin-ext-wght-normal.woff2",
+      "assets/geist-latin-wght-normal.woff2"
+    ]
+  },
+  "src/ComparatorDiff.tsx": {
+    "file": "assets/ComparatorDiff-66W6QEYa.js",
+    "name": "ComparatorDiff",
+    "src": "src/ComparatorDiff.tsx",
+    "isDynamicEntry": true,
+    "imports": [
+      "_react-runtime-CVWkU7n2.js",
+      "_monaco-BcGYlSEi.js"
+    ]
+  }
+}
