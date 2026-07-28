@@ -29,7 +29,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_PR: ${{ steps.release.outputs.pr }}
-        run: gh workflow run ci.yml --ref "$(jq -r .headBranchName <<< "$RELEASE_PR")"
+        run: gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$(jq -r .headBranchName <<< "$RELEASE_PR")"
 
   publish-cli:
     needs: release-please
