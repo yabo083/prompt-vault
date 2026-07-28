@@ -1,6 +1,6 @@
 {
   "name": "@miyako-lab/prompt-vault-cli",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Authenticated command-line client for Prompt Vault hosts",
   "license": "GPL-3.0-or-later",
   "type": "module",
