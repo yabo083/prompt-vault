@@ -78,8 +78,8 @@ jobs:
           path: artifacts/prompt-vault.tgz
           if-no-files-found: error
 
-  publish-cli-version:
-    needs: [release-please, build-artifact]
+  publish-cli:
+    needs: [release-please, build-artifact, publish-container]
     if: ${{ needs.release-please.outputs.releases-created == 'true' || inputs.publish-release == true }}
     runs-on: ubuntu-latest
     steps:
@@ -92,32 +92,17 @@ jobs:
         with:
           name: prompt-vault-${{ needs.build-artifact.outputs.version }}
           path: artifacts
-      - name: Publish the immutable npm version under the staging tag
-        run: npm publish ./artifacts/prompt-vault.tgz --access public --tag staged
-
-  publish-cli:
-    needs: [release-please, build-artifact, publish-cli-version, publish-container]
-    if: ${{ needs.release-please.outputs.releases-created == 'true' || inputs.publish-release == true }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/setup-node@v6
-        with:
-          node-version: "24"
-          registry-url: https://registry.npmjs.org
-          package-manager-cache: false
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Promote npm latest or restore the previous container alias
+      - name: Publish npm or restore the previous container alias
         env:
           PREVIOUS_LATEST: ${{ needs.publish-container.outputs.previous-latest }}
-          VERSION: ${{ needs.build-artifact.outputs.version }}
         run: |
-          if npm dist-tag add "@miyako-lab/prompt-vault-cli@$VERSION" latest; then
-            npm dist-tag rm @miyako-lab/prompt-vault-cli staged || true
+          if npm publish ./artifacts/prompt-vault.tgz --access public; then
             exit 0
           fi
           if [ -n "$PREVIOUS_LATEST" ]; then
@@ -128,8 +113,8 @@ jobs:
           exit 1
 
   publish-container:
-    needs: [release-please, build-artifact, publish-cli-version]
-    if: ${{ always() && needs.build-artifact.result == 'success' && (needs.publish-cli-version.result == 'success' || (inputs.container-version != '' && inputs.publish-release != true)) }}
+    needs: [release-please, build-artifact]
+    if: ${{ needs.release-please.outputs.releases-created == 'true' || inputs.container-version != '' }}
     runs-on: ubuntu-latest
     outputs:
       previous-latest: ${{ steps.promote.outputs.previous-latest }}

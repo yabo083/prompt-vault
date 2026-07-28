@@ -414,7 +414,7 @@ Security defects precede distribution expansion:
 7. Implement the separate onboarding completion view.
 8. Produce and smoke-test the canonical npm tarball on all platforms.
 9. Build and verify Docker from that tarball.
-10. Publish immutable npm and image versions. Promote Docker `latest` first, verify it, then promote npm `latest`; if npm promotion fails, restore Docker `latest` to the previous digest.
+10. Publish and verify the immutable image version, promote Docker `latest`, then use npm Trusted Publishing to publish the immutable npm version and `latest` together; if npm publishing fails, restore Docker `latest` to the previous digest.
 
 ## Out Of Scope
 
