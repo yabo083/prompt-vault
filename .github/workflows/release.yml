@@ -7,9 +7,14 @@ on:
   workflow_dispatch:
     inputs:
       container-version:
-        description: Current source release version to republish to GHCR only
+        description: Release version to rebuild from its vX.Y.Z tag
         required: false
         type: string
+      publish-release:
+        description: Publish npm and GHCR aliases in addition to the immutable versions
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   actions: write
@@ -45,6 +50,8 @@ jobs:
       sha256: ${{ steps.package.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.container-version != '' && format('v{0}', inputs.container-version) || github.sha }}
       - uses: actions/setup-node@v6
         with:
           node-version: "20.20.0"
@@ -73,7 +80,7 @@ jobs:
 
   publish-cli-version:
     needs: [release-please, build-artifact]
-    if: ${{ needs.release-please.outputs.releases-created == 'true' }}
+    if: ${{ needs.release-please.outputs.releases-created == 'true' || inputs.publish-release == true }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/setup-node@v6
@@ -86,11 +93,11 @@ jobs:
           name: prompt-vault-${{ needs.build-artifact.outputs.version }}
           path: artifacts
       - name: Publish the immutable npm version under the staging tag
-        run: npm publish artifacts/prompt-vault.tgz --access public --tag staged
+        run: npm publish ./artifacts/prompt-vault.tgz --access public --tag staged
 
   publish-cli:
     needs: [release-please, build-artifact, publish-cli-version, publish-container]
-    if: ${{ needs.release-please.outputs.releases-created == 'true' }}
+    if: ${{ needs.release-please.outputs.releases-created == 'true' || inputs.publish-release == true }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/setup-node@v6
@@ -122,12 +129,14 @@ jobs:
 
   publish-container:
     needs: [release-please, build-artifact, publish-cli-version]
-    if: ${{ always() && needs.build-artifact.result == 'success' && (inputs.container-version != '' || needs.publish-cli-version.result == 'success') }}
+    if: ${{ always() && needs.build-artifact.result == 'success' && (needs.publish-cli-version.result == 'success' || (inputs.container-version != '' && inputs.publish-release != true)) }}
     runs-on: ubuntu-latest
     outputs:
       previous-latest: ${{ steps.promote.outputs.previous-latest }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.container-version != '' && format('v{0}', inputs.container-version) || github.sha }}
       - uses: actions/download-artifact@v5
         with:
           name: prompt-vault-${{ needs.build-artifact.outputs.version }}
