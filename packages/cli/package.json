@@ -1,6 +1,6 @@
 {
   "name": "@miyako-lab/prompt-vault-cli",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Run a local Prompt Vault or connect agents to an external Vault Host",
   "license": "GPL-3.0-or-later",
   "type": "module",

@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.0](https://github.com/yabo083/prompt-vault/compare/v1.2.0...v1.3.0) (2026-07-28)
+
+
+### Features
+
+* ship managed local and external vault hosts ([55eed28](https://github.com/yabo083/prompt-vault/commit/55eed2882814de4f08b0e12f467f462540ef11b3))
+
 ## [1.2.0](https://github.com/yabo083/prompt-vault/compare/v1.1.0...v1.2.0) (2026-07-28)
 
 
