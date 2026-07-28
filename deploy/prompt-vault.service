@@ -1,0 +1,21 @@
+[Unit]
+Description=Prompt Vault
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/prompt-vault
+Environment=PORT=8767
+Environment=HOST=0.0.0.0
+Environment=PROMPT_VAULT_WORKSPACE=/root/prompt-vault/workspace
+Environment=PROMPT_VAULT_TOKEN_FILE=/root/prompt-vault/.vault-token
+Environment=PROMPT_VAULT_CREDENTIAL_DIRECTORY=/root/prompt-vault/.vault-auth
+Environment=PROMPT_VAULT_PUBLIC_URL=http://192.168.0.107:8767
+Environment=PROMPT_VAULT_STATIC_DIRECTORY=/root/prompt-vault/static/dist
+ExecStart=/usr/bin/node /root/prompt-vault/dist/server/index.js
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

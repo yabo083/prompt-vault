@@ -16,8 +16,8 @@ type RectLike = {
 type PointLike = { x: number; y: number };
 
 type SaveDraft = {
-  change_note: string;
-  parents: number[];
+  note: string;
+  parentIds: number[];
 };
 
 export type EditorSessionState = {
@@ -93,12 +93,16 @@ export function graphToViewportPoint(point: PointLike, position: PointLike, zoom
 }
 
 export function initialEditorIntent(_version: number | null, requested?: EditorIntent): EditorIntent {
-  return requested || "overwrite";
+  return requested || "updateDraft";
 }
 
-export function canSaveEditor(version: number | null, intent: EditorIntent, draft: SaveDraft, canCreateRoot = false) {
-  if (intent === "overwrite") return true;
-  return draft.parents.length > 0 || (version == null && canCreateRoot);
+export function canSaveEditor(_version: number | null, _intent: EditorIntent, _draft: SaveDraft, _canCreateRoot = false) {
+  return true;
+}
+
+export function editorSaveOperation(version: number | null, intent: EditorIntent): "overwriteRevision" | "updateDraft" | "saveChild" {
+  if (intent === "saveRevision") return "saveChild";
+  return version == null ? "updateDraft" : "overwriteRevision";
 }
 
 export function nextEditorState(current: EditorSessionState, version: number | null, intent?: EditorIntent, parents: number[] = []): EditorSessionState {

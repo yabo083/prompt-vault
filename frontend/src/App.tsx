@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useRef, useState, type CSSProperties } from "react";
+import { forwardRef, lazy, Suspense, useEffect, useRef, useState, type CSSProperties, type ReactNode as ReactNodeContent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   CanvasEvent,
@@ -20,7 +20,8 @@ import Autoplay from "embla-carousel-autoplay";
 import {
   Archive,
   ArrowLeft,
-  Check,
+  ChevronLeft,
+  ChevronRight,
   ChevronDown,
   Copy,
   Download,
@@ -34,8 +35,10 @@ import {
   LocateFixed,
   Maximize2,
   Menu,
+  Monitor,
   Moon,
   MousePointer2,
+  Pencil,
   Plus,
   Search,
   Settings,
@@ -48,14 +51,17 @@ import {
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
-import { ApiError, api, getStoredToken, setStoredToken, type AssetOrderEntry } from "./api";
+import { ApiError, api, connectBrowser } from "./api";
 import { Button } from "./components/ui/button";
 import { Input } from "./components/ui/input";
 import { Kbd } from "./components/ui/kbd";
 import { Textarea } from "./components/ui/textarea";
-import { ancestorsOf, toGraphData, type VaultNodeData, versionId } from "./graph-data";
-import { approachZoom, availableViewportCenter, canSaveEditor, graphToViewportPoint, initialEditorIntent, nextEditorState, pointerClickAction, pointerDragAction, rectanglesIntersect, translationToCenter, viewportToGraphPoint, wheelDeltaPixels, wheelZoomTarget, type EditorSessionState } from "./interaction-state";
+import { fitCanvasText } from "./share-card-text";
+import { ancestorsOf, graphStructureSignature, toGraphData, type VaultNodeData } from "./graph-data";
+import { approachZoom, availableViewportCenter, canSaveEditor, editorSaveOperation, graphToViewportPoint, initialEditorIntent, nextEditorState, pointerClickAction, pointerDragAction, rectanglesIntersect, translationToCenter, viewportToGraphPoint, wheelDeltaPixels, wheelZoomTarget, type EditorSessionState } from "./interaction-state";
+import { buildCarouselSlides, carouselAutoplayOptions, loadLibraryPreferences, saveLibraryPreferences, usesCarousel, type CarouselPreferences, type LibraryPreferences } from "./library-preferences";
 import { syncReactEdges, syncReactNodePositions, syncReactNodeViewport, type ReactOverlayEdge } from "./react-node-viewport";
+import { nextThemeMode, normalizeThemeMode, resolveThemeMode, type ThemeMode } from "./theme-mode";
 import { loadWorkspacePreferences, saveWorkspacePreferences, type WorkspacePreferences } from "./workspace-preferences";
 import type {
   Asset,
@@ -65,7 +71,7 @@ import type {
   EditorIntent,
   Theme,
   ThemeFilter,
-  VersionDetail,
+  Revision,
 } from "./types";
 
 const ComparatorDiff = lazy(() => import("./ComparatorDiff"));
@@ -73,37 +79,48 @@ const ComparatorDiff = lazy(() => import("./ComparatorDiff"));
 register(ExtensionCategory.NODE, "vault-react", ReactNode);
 
 const emptyDraft: EditorDraft = {
-  change_note: "",
+  note: "",
   prompt: "",
   negative: "",
   notes: "",
   model: "",
   params: "",
-  parents: [],
+  parentIds: [],
 };
 
-function IconButton({ label, children, ...props }: React.ButtonHTMLAttributes<HTMLButtonElement> & { label: string }) {
+const IconButton = forwardRef<HTMLButtonElement, React.ButtonHTMLAttributes<HTMLButtonElement> & { label: string }>(function IconButton({ label, children, ...props }, ref) {
   return (
     <Tooltip.Root>
       <Tooltip.Trigger asChild>
-        <Button variant="ghost" size="icon" className="icon-button" aria-label={label} {...props}>{children}</Button>
+        <Button ref={ref} variant="ghost" size="icon" className="icon-button" aria-label={label} {...props}>{children}</Button>
       </Tooltip.Trigger>
       <Tooltip.Portal><Tooltip.Content className="tooltip" sideOffset={8}>{label}</Tooltip.Content></Tooltip.Portal>
     </Tooltip.Root>
   );
-}
+});
 
 function useThemeMode() {
-  const [mode, setMode] = useState<"light" | "dark">(() => {
-    const saved = localStorage.getItem("prompt-vault-theme");
-    if (saved === "light" || saved === "dark") return saved;
-    return matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
-  });
+  const [mode, setMode] = useState<ThemeMode>(() => normalizeThemeMode(localStorage.getItem("prompt-vault-theme")));
+  const [systemDark, setSystemDark] = useState(() => matchMedia("(prefers-color-scheme: dark)").matches);
+  const resolvedMode = resolveThemeMode(mode, systemDark);
   useEffect(() => {
-    document.documentElement.dataset.theme = mode;
+    const media = matchMedia("(prefers-color-scheme: dark)");
+    const update = (event: MediaQueryListEvent) => setSystemDark(event.matches);
+    setSystemDark(media.matches);
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+  useEffect(() => {
+    document.documentElement.dataset.theme = resolvedMode;
     localStorage.setItem("prompt-vault-theme", mode);
-  }, [mode]);
-  return [mode, setMode] as const;
+  }, [mode, resolvedMode]);
+  return [mode, setMode, resolvedMode] as const;
+}
+
+function ThemeModeButton({ mode, onChange }: { mode: ThemeMode; onChange: (mode: ThemeMode) => void }) {
+  const label = mode === "system" ? "跟随系统" : mode === "light" ? "浅色" : "深色";
+  const Icon = mode === "system" ? Monitor : mode === "light" ? Sun : Moon;
+  return <IconButton label={`主题：${label}，点击切换`} onClick={() => onChange(nextThemeMode(mode))}><Icon size={17} /></IconButton>;
 }
 
 function useMobileWorkspace() {
@@ -116,53 +133,129 @@ function useMobileWorkspace() {
   return mobile;
 }
 
-function RepresentativeCarousel({ theme }: { theme: Theme }) {
-  const representatives = theme.representative_versions.filter((item) => item.preview_url);
-  const fallback = theme.assets.result[0]?.url || theme.assets.reference[0]?.url || null;
-  const slides = representatives.length ? representatives : fallback ? [{ version: 0, change_note: theme.title, preview_url: fallback }] : [];
-  const autoplay = useRef(Autoplay({ delay: 1400, stopOnInteraction: false, rootNode: (root) => root.parentElement }));
-  const [emblaRef, emblaApi] = useEmblaCarousel({ loop: slides.length > 1 }, [autoplay.current]);
-  useEffect(() => { autoplay.current.stop(); }, []);
-
-  if (!slides.length) {
-    return <div className="theme-art empty-art"><ImageIcon size={24} /><span>PV</span></div>;
-  }
+function CarouselSettingsFields({ preferences, onChange }: { preferences: CarouselPreferences; onChange: (preferences: CarouselPreferences) => void }) {
   return (
-    <div
-      className="theme-art embla"
-      ref={emblaRef}
-      onMouseEnter={() => slides.length > 1 && autoplay.current.play()}
-      onMouseLeave={() => { autoplay.current.stop(); emblaApi?.scrollTo(0); }}
-    >
-      <div className="embla-container">
-        {slides.map((slide, index) => (
-          <div className="embla-slide" key={`${slide.version}-${index}`}>
-            <img src={slide.preview_url!} alt="" loading="lazy" />
-          </div>
-        ))}
-      </div>
+    <div className="settings-field-list">
+      <label className="switch-setting"><span><strong>自动播放</strong><small>卡片包含多张图片时自动切换</small></span><input type="checkbox" checked={preferences.autoplay} onChange={(event) => onChange({ ...preferences, autoplay: event.target.checked })} /></label>
+      <label className="range-setting"><span>切换间隔 <strong>{(preferences.delayMs / 1000).toFixed(1)} 秒</strong></span><input type="range" min="1000" max="10000" step="200" value={preferences.delayMs} disabled={!preferences.autoplay} onChange={(event) => onChange({ ...preferences, delayMs: Number(event.target.value) })} /></label>
+      <label className="switch-setting"><span><strong>悬停时暂停</strong><small>关闭后鼠标划过不干预轮播</small></span><input type="checkbox" checked={preferences.pauseOnHover} disabled={!preferences.autoplay} onChange={(event) => onChange({ ...preferences, pauseOnHover: event.target.checked })} /></label>
+      <label className="switch-setting"><span><strong>循环播放</strong><small>关闭后停在最后一张图片</small></span><input type="checkbox" checked={preferences.loop} onChange={(event) => onChange({ ...preferences, loop: event.target.checked })} /></label>
     </div>
   );
 }
 
-function ThemeCard({ theme, onOpen }: { theme: Theme; onOpen: () => void }) {
+function EmblaImageCarousel({ urls, label, preferences, className }: { urls: string[]; label: string; preferences: CarouselPreferences; className: string }) {
+  const autoplay = useRef(Autoplay(carouselAutoplayOptions(preferences)));
+  const [emblaRef, emblaApi] = useEmblaCarousel({ loop: preferences.loop, watchDrag: false }, [autoplay.current]);
   return (
-    <button className="theme-card" onClick={onOpen}>
-      <RepresentativeCarousel theme={theme} />
-      <div className="theme-card-body">
-        <div className="theme-card-title"><span>{theme.title}</span>{theme.starred && <Star size={14} fill="currentColor" />}</div>
-        <p>{theme.description || theme.prompt || " "}</p>
-        <div className="theme-card-meta"><span>{theme.version_count} 节点</span><span>{theme.category}</span></div>
+    <div className={`${className} embla`} ref={emblaRef} role="region" aria-label={`${label} 成图轮播`} tabIndex={0} onKeyDown={(event) => { if (event.key === "ArrowLeft") emblaApi?.scrollPrev(); if (event.key === "ArrowRight") emblaApi?.scrollNext(); }}>
+      <div className="embla-container">
+        {urls.map((url, index) => (
+          <div className="embla-slide" key={`${url}-${index}`}>
+            <img src={url} alt={`${label} 图片 ${index + 1}`} loading="lazy" draggable={false} />
+          </div>
+        ))}
       </div>
-    </button>
+      <button type="button" className="carousel-control previous" aria-label="上一张成图" onClick={(event) => { event.stopPropagation(); emblaApi?.scrollPrev(); }}><ChevronLeft size={16} /></button>
+      <button type="button" className="carousel-control next" aria-label="下一张成图" onClick={(event) => { event.stopPropagation(); emblaApi?.scrollNext(); }}><ChevronRight size={16} /></button>
+    </div>
   );
 }
 
-function Library({ onOpen, onUnauthorized }: { onOpen: (slug: string) => void; onUnauthorized: () => void }) {
+function ImageCarousel({ urls, fallbackUrl, label, preferences, className, empty }: { urls: string[]; fallbackUrl?: string | null; label: string; preferences: CarouselPreferences; className: string; empty: ReactNodeContent }) {
+  if (usesCarousel(urls)) return <EmblaImageCarousel urls={urls} label={label} preferences={preferences} className={className} />;
+  const staticUrl = urls[0] || fallbackUrl;
+  if (!staticUrl) return empty;
+  return <div className={className}><img src={staticUrl} alt={`${label} 图片`} loading="lazy" draggable={false} /></div>;
+}
+
+function RepresentativeCarousel({ theme, preferences }: { theme: Theme; preferences: LibraryPreferences }) {
+  const slides = buildCarouselSlides({
+    title: theme.title,
+    representatives: theme.representativeRevisions,
+    draftResults: theme.draft.assets.result.map((asset) => ({ previewUrl: asset.url, sha256: asset.sha256 })),
+  }, preferences.includeDraftAssets);
+  return <ImageCarousel urls={slides.map((slide) => slide.previewUrl)} label={theme.title} preferences={preferences} className="theme-art" empty={<div className="theme-art empty-art"><ImageIcon size={24} /><span>PV</span></div>} />;
+}
+
+function ThemeCard({ theme, preferences, onOpen }: { theme: Theme; preferences: LibraryPreferences; onOpen: () => void }) {
+  const carouselKey = `${preferences.autoplay}:${preferences.delayMs}:${preferences.pauseOnHover}:${preferences.loop}:${preferences.includeDraftAssets}`;
+  return (
+    <article className="theme-card" onClick={onOpen}>
+      <RepresentativeCarousel key={carouselKey} theme={theme} preferences={preferences} />
+      <button type="button" className="theme-card-body" aria-label={`打开主题 ${theme.title}`}>
+        <div className="theme-card-title"><span>{theme.title}</span>{theme.starred && <Star size={14} fill="currentColor" />}</div>
+        <p>{theme.description || theme.draft.prompt || " "}</p>
+        <div className="theme-card-meta"><span>{theme.revisionCount} Revisions</span><span>{theme.category}</span></div>
+      </button>
+    </article>
+  );
+}
+
+function LibrarySettingsDialog({
+  open,
+  preferences,
+  onClose,
+  onChange,
+}: {
+  open: boolean;
+  preferences: LibraryPreferences;
+  onClose: () => void;
+  onChange: (preferences: LibraryPreferences) => void;
+}) {
+  const [search, setSearch] = useState("");
+  useEffect(() => {
+    if (open) setSearch("");
+  }, [open]);
+  const carouselVisible = "首页卡片轮播".includes(search.trim());
+  return (
+    <Dialog.Root open={open} onOpenChange={(value) => !value && onClose()}>
+      <Dialog.Portal>
+        <Dialog.Overlay className="dialog-overlay" />
+        <Dialog.Content className="dialog-content settings-dialog">
+          <Dialog.Title className="sr-only">首页设置</Dialog.Title>
+          <Dialog.Description className="sr-only">控制主题卡片的图片轮播行为。</Dialog.Description>
+          <Dialog.Close asChild><button className="dialog-close" aria-label="关闭"><X size={18} /></button></Dialog.Close>
+          <div className="settings-layout">
+            <nav className="settings-sidebar" aria-label="设置分类">
+              <div className="settings-search"><Search size={14} /><Input className="settings-search-input" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索设置" aria-label="搜索设置" /></div>
+              <div className="settings-nav" role="tablist" aria-orientation="vertical">
+                {carouselVisible ? <div className="settings-nav-group"><span className="settings-nav-title">首页</span><button type="button" role="tab" aria-selected="true" className="active"><ImageIcon size={15} /><span>卡片轮播</span></button></div> : <p className="settings-no-results">没有匹配的设置</p>}
+              </div>
+              <span className="settings-version">Prompt Vault</span>
+            </nav>
+            <div className="settings-panel">
+              <header className="settings-panel-header"><h2>首页卡片轮播</h2><p>仅当首页主题卡片包含多张成图时启用。</p></header>
+              <div className="settings-content" role="tabpanel">
+                <section className="settings-section">
+                  <div className="settings-section-heading"><h3>首页轮播行为</h3><p>单张成图静态显示；参考图不加入轮播。</p></div>
+                  <CarouselSettingsFields preferences={preferences} onChange={(carousel) => onChange({ ...preferences, ...carousel })} />
+                </section>
+                <section className="settings-section">
+                  <div className="settings-section-heading"><h3>图片来源</h3><p>控制首页卡片是否包含当前 Draft 的全部成图。</p></div>
+                  <label className="switch-setting"><span><strong>Draft 成图参与轮播</strong><small>把当前 Draft 的结果图加入代表 Revision 成图</small></span><input type="checkbox" checked={preferences.includeDraftAssets} onChange={(event) => onChange({ ...preferences, includeDraftAssets: event.target.checked })} /></label>
+                </section>
+              </div>
+            </div>
+          </div>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
+  );
+}
+
+function Library({ onOpen, onUnauthorized, themeMode, onThemeModeChange }: { onOpen: (slug: string) => void; onUnauthorized: () => void; themeMode: ThemeMode; onThemeModeChange: (mode: ThemeMode) => void }) {
   const [filter, setFilter] = useState<ThemeFilter>("active");
   const [search, setSearch] = useState("");
   const [createOpen, setCreateOpen] = useState(false);
-  const [newTheme, setNewTheme] = useState({ title: "", prompt: "", description: "" });
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [fabOpen, setFabOpen] = useState(false);
+  const [batchOpen, setBatchOpen] = useState(false);
+  const [batchSelected, setBatchSelected] = useState<string[]>([]);
+  const [batchWorking, setBatchWorking] = useState(false);
+  const [batchError, setBatchError] = useState("");
+  const [libraryPreferences, setLibraryPreferences] = useState(loadLibraryPreferences);
+  const [newTheme, setNewTheme] = useState({ title: "", category: "", prompt: "", description: "" });
   const queryClient = useQueryClient();
   const themesQuery = useQuery({ queryKey: ["themes", search], queryFn: () => api.themes(search) });
   const createMutation = useMutation({
@@ -180,10 +273,35 @@ function Library({ onOpen, onUnauthorized }: { onOpen: (slug: string) => void; o
   const themes = (themesQuery.data || []).filter((theme) => {
     if (filter === "active") return !theme.archived;
     if (filter === "archived") return theme.archived;
-    if (filter === "favorite") return theme.starred || theme.has_favorite_versions;
+    if (filter === "favorite") return theme.starred || theme.hasFavoriteRevisions;
     return true;
   });
   const filters: Array<[ThemeFilter, string]> = [["active", "迭代中"], ["archived", "已归档"], ["favorite", "收藏"], ["all", "全部"]];
+  const toggleBatchTheme = (slug: string) => setBatchSelected((current) => current.includes(slug) ? current.filter((item) => item !== slug) : [...current, slug]);
+  const deleteBatch = async () => {
+    if (!batchSelected.length || !confirm(`将 ${batchSelected.length} 个主题移入回收站？`)) return;
+    setBatchWorking(true);
+    setBatchError("");
+    try {
+      const results = await Promise.allSettled(batchSelected.map((slug) => api.deleteTheme(slug)));
+      const failed = batchSelected.filter((_, index) => results[index].status === "rejected");
+      setBatchSelected(failed);
+      await queryClient.invalidateQueries({ queryKey: ["themes"] });
+      if (failed.length) setBatchError(`${failed.length} 个主题删除失败，请重试`);
+      else setBatchOpen(false);
+    } finally {
+      setBatchWorking(false);
+    }
+  };
+  const exportAll = async () => {
+    const payload = await api.exportVault();
+    const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" }));
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = "prompt-vault-export.json";
+    anchor.click();
+    URL.revokeObjectURL(url);
+  };
 
   return (
     <main className="library-shell">
@@ -191,27 +309,49 @@ function Library({ onOpen, onUnauthorized }: { onOpen: (slug: string) => void; o
         <div className="wordmark"><span>PV</span><strong>Prompt Vault</strong></div>
         <div className="header-actions">
           <label className="search-field"><Search size={16} /><Input className="search-input" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索主题、标签或提示词" /></label>
-          <Button onClick={() => setCreateOpen(true)}><Plus size={16} />新建主题</Button>
+          <ThemeModeButton mode={themeMode} onChange={onThemeModeChange} />
+          <IconButton label="首页设置" onClick={() => setSettingsOpen(true)}><Settings size={16} /></IconButton>
         </div>
       </header>
       <nav className="filter-tabs" aria-label="主题分类">
         {filters.map(([value, label]) => <button key={value} className={filter === value ? "active" : ""} onClick={() => setFilter(value)}>{label}</button>)}
       </nav>
       <section className="theme-grid">
-        {themes.map((theme) => <ThemeCard key={theme.slug} theme={theme} onOpen={() => onOpen(theme.slug)} />)}
+        {themes.map((theme) => <ThemeCard key={theme.slug} theme={theme} preferences={libraryPreferences} onOpen={() => onOpen(theme.slug)} />)}
       </section>
       {!themesQuery.isLoading && !themes.length && <div className="quiet-empty">没有符合当前条件的主题</div>}
       <Dialog.Root open={createOpen} onOpenChange={setCreateOpen}>
         <Dialog.Portal>
           <Dialog.Overlay className="dialog-overlay" />
           <Dialog.Content className="dialog-content create-dialog">
-            <Dialog.Title>新建主题</Dialog.Title>
-            <Dialog.Description className="sr-only">创建一个独立的提示词探索主题。</Dialog.Description>
+            <header className="dialog-heading"><Dialog.Title>新建主题</Dialog.Title><Dialog.Description>创建一个独立的提示词探索主题，之后可以继续补充图片与版本。</Dialog.Description></header>
             <Dialog.Close asChild><button className="dialog-close" aria-label="关闭"><X size={18} /></button></Dialog.Close>
-            <label>名称<Input autoFocus value={newTheme.title} onChange={(event) => setNewTheme({ ...newTheme, title: event.target.value })} /></label>
-            <label>初始提示词<Textarea rows={7} value={newTheme.prompt} onChange={(event) => setNewTheme({ ...newTheme, prompt: event.target.value })} /></label>
-            <label>描述<Input value={newTheme.description} onChange={(event) => setNewTheme({ ...newTheme, description: event.target.value })} /></label>
+            <div className="dialog-field-grid"><label>名称<Input autoFocus value={newTheme.title} onChange={(event) => setNewTheme({ ...newTheme, title: event.target.value })} /></label><label>分类<Input value={newTheme.category} onChange={(event) => setNewTheme({ ...newTheme, category: event.target.value })} placeholder="例如：角色设计" /></label></div>
+            <label>初始提示词<Textarea className="code-textarea" rows={7} value={newTheme.prompt} onChange={(event) => setNewTheme({ ...newTheme, prompt: event.target.value })} /></label>
+            <label>描述<Textarea rows={3} value={newTheme.description} onChange={(event) => setNewTheme({ ...newTheme, description: event.target.value })} /></label>
             <div className="dialog-actions"><Button disabled={!newTheme.title.trim() || createMutation.isPending} onClick={() => createMutation.mutate()}>创建</Button></div>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
+      <LibrarySettingsDialog open={settingsOpen} preferences={libraryPreferences} onClose={() => setSettingsOpen(false)} onChange={(preferences) => { saveLibraryPreferences(preferences); setLibraryPreferences(preferences); }} />
+      <div className="library-fab">
+        <motion.div className="fab-menu" aria-hidden={!fabOpen} initial={false} animate={fabOpen ? { opacity: 1, y: 0, scale: 1, pointerEvents: "auto" } : { opacity: 0, y: 10, scale: 0.96, pointerEvents: "none" }} transition={{ duration: 0.16 }}>
+          <Button variant="secondary" className="fab-action" tabIndex={fabOpen ? 0 : -1} onClick={() => { setFabOpen(false); setCreateOpen(true); }}><FilePlus2 size={16} />新建</Button>
+          <Button variant="secondary" className="fab-action" tabIndex={fabOpen ? 0 : -1} onClick={() => { setFabOpen(false); setBatchSelected([]); setBatchError(""); setBatchOpen(true); }}><Menu size={16} />批量管理</Button>
+        </motion.div>
+        <Button size="icon" className="fab-trigger" aria-label={fabOpen ? "收起操作菜单" : "展开操作菜单"} aria-expanded={fabOpen} onClick={() => setFabOpen((value) => !value)}><motion.span animate={{ rotate: fabOpen ? 45 : 0 }} transition={{ duration: 0.18 }}><Plus size={24} /></motion.span></Button>
+      </div>
+      <Dialog.Root open={batchOpen} onOpenChange={setBatchOpen}>
+        <Dialog.Portal>
+          <Dialog.Overlay className="dialog-overlay" />
+          <Dialog.Content className="dialog-content batch-dialog">
+            <header className="dialog-heading"><Dialog.Title>批量管理</Dialog.Title><Dialog.Description>选择主题后批量移入回收站，或导出当前 Vault 索引。</Dialog.Description></header>
+            <Dialog.Close asChild><button className="dialog-close" aria-label="关闭"><X size={18} /></button></Dialog.Close>
+            <div className="batch-theme-list">
+              {(themesQuery.data || []).map((theme) => <label className="batch-theme-row" key={theme.slug}><input type="checkbox" checked={batchSelected.includes(theme.slug)} onChange={() => toggleBatchTheme(theme.slug)} /><span><strong>{theme.title}</strong><small>{theme.revisionCount} Revisions</small></span></label>)}
+            </div>
+            {batchError && <p className="batch-error" role="alert">{batchError}</p>}
+            <div className="dialog-actions"><Button variant="secondary" onClick={() => void exportAll()}><Download size={15} />导出索引</Button><Button variant="destructive" disabled={!batchSelected.length || batchWorking} onClick={() => void deleteBatch()}><Trash2 size={15} />删除所选</Button></div>
           </Dialog.Content>
         </Dialog.Portal>
       </Dialog.Root>
@@ -219,16 +359,14 @@ function Library({ onOpen, onUnauthorized }: { onOpen: (slug: string) => void; o
   );
 }
 
-function VersionNodeCard({ data }: { data: VaultNodeData & { selected?: boolean; dimmed?: boolean; lineage?: boolean } }) {
+function RevisionNodeCard({ data }: { data: VaultNodeData & { selected?: boolean; dimmed?: boolean; lineage?: boolean } }) {
   const className = ["version-node", data.working && "working", data.selected && "selected", data.dimmed && "dimmed", data.lineage && "lineage"].filter(Boolean).join(" ");
+  const carouselKey = `${data.previewUrls.join("|")}:${data.carousel.autoplay}:${data.carousel.delayMs}:${data.carousel.pauseOnHover}:${data.carousel.loop}`;
   return (
     <div className={className} data-version={data.version ?? "working"} style={{ "--node-width": `${data.width}px` } as CSSProperties}>
-      <div className="node-image">
-        {data.preview ? <img src={data.preview} alt="" draggable={false} /> : <div className="node-image-empty"><ImageIcon size={22} /></div>}
-        <div className="node-flags">{data.featured && <Focus size={14} />}{data.favorite && <Star size={14} fill="currentColor" />}</div>
-      </div>
+      <div className="node-media"><ImageCarousel key={carouselKey} urls={data.previewUrls} fallbackUrl={data.preview} label={data.title} preferences={data.carousel} className="node-image" empty={<div className="node-image node-image-empty"><ImageIcon size={22} /></div>} /><div className="node-flags">{data.featured && <Focus size={14} />}{data.favorite && <Star size={14} fill="currentColor" />}</div></div>
       <div className="node-body">
-        <div className="node-heading"><strong>{data.title}</strong><span>{data.working ? "LIVE" : `#${String(data.version).padStart(4, "0")}`}</span></div>
+        <div className="node-heading"><strong>{data.title}</strong><span>{data.working ? "DRAFT" : `R${String(data.version).padStart(4, "0")}`}</span></div>
         {data.showPrompt && <p>{data.prompt || " "}</p>}
         <div className="node-params"><span>{data.model || "MODEL -"}</span>{data.dirty && <span className="dirty-mark">UNSAVED</span>}</div>
       </div>
@@ -267,23 +405,14 @@ function VersionCanvas({
   onZoomChange: (zoom: number) => void;
 }) {
   const graphData = toGraphData(theme, preferences);
-  const graphContentKey = JSON.stringify([
-    theme.updated_at,
-    theme.dirty,
-    theme.prompt,
-    theme.model,
-    theme.params,
-    theme.assets,
-    theme.versions,
-    preferences.autoFit,
-    preferences.initialZoom,
-    preferences.nodeWidth,
-    preferences.showPrompt,
-  ]);
+  const graphContentKey = graphStructureSignature(theme, preferences);
+  const graphVisualKey = JSON.stringify(graphData.nodes.map((node) => [node.id, node.data]));
   const containerRef = useRef<HTMLDivElement>(null);
   const graphRef = useRef<Graph | null>(null);
   const reduceMotion = useReducedMotion();
   const [graphReady, setGraphReady] = useState(false);
+  const [graphPositioned, setGraphPositioned] = useState(false);
+  const graphPositionedRef = useRef(false);
   const pointerDragRef = useRef({ button: -1, pointerId: -1, startX: 0, startY: 0, x: 0, y: 0, moved: false, captured: false, nodeId: "", vx: 0, vy: 0, additive: false, initialSelected: [] as number[], selectionBox: null as HTMLDivElement | null });
   const zoomControllerRef = useRef<(target: number, origin?: [number, number]) => void>(() => undefined);
   const centerControllerRef = useRef<(version: number | null | undefined) => void>(() => undefined);
@@ -306,7 +435,7 @@ function VersionCanvas({
   zoomRef.current = zoom;
   callbacks.current = { onSelected, onOpen, onBlank, onContext, onZoomChange };
   const getOverlayEdges = (selection: number[]): ReactOverlayEdge[] => {
-    const lineage = ancestorsOf(themeRef.current.versions, selection);
+    const lineage = ancestorsOf(themeRef.current.revisions, selection);
     return graphDataRef.current.edges.map((edge) => {
       const data = edge.data as { sourceVersion: number; targetVersion: number | null };
       const state = selection.length && data.targetVersion != null && lineage.has(data.sourceVersion) && lineage.has(data.targetVersion)
@@ -319,6 +448,8 @@ function VersionCanvas({
   useEffect(() => {
     if (!containerRef.current) return;
     setGraphReady(false);
+    setGraphPositioned(false);
+    graphPositionedRef.current = false;
     const graph = new Graph({
       container: containerRef.current,
       data: graphDataRef.current,
@@ -328,7 +459,7 @@ function VersionCanvas({
       node: {
         type: "vault-react",
         style: {
-          component: (datum: NodeData) => <VersionNodeCard data={datum.data as VaultNodeData} />,
+          component: (datum: NodeData) => <RevisionNodeCard data={datum.data as VaultNodeData} />,
         },
       },
       edge: {
@@ -351,6 +482,10 @@ function VersionCanvas({
     let zoomTarget = zoomRef.current;
     let zoomOrigin: [number, number] | undefined;
     const container = containerRef.current;
+    const revealGraph = () => {
+      graphPositionedRef.current = true;
+      setGraphPositioned(true);
+    };
     const syncHtmlGraph = () => {
       syncReactEdges(container, graph, getOverlayEdges(selectedRef.current));
     };
@@ -438,16 +573,17 @@ function VersionCanvas({
       return { x: (left + right) / 2, y: (top + bottom) / 2 };
     };
     const centerRenderedCards = async (version: number | null | undefined, animation: false | { duration: number; easing: string }) => {
-      if (disposed) return;
+      if (disposed) return false;
       const selector = version === undefined ? ".version-node" : `.version-node[data-version="${version ?? "working"}"]`;
       const current = renderedCenter(Array.from(container.querySelectorAll<HTMLElement>(selector)));
-      if (!current) return;
+      if (!current) return false;
       const viewport = container.getBoundingClientRect();
       const editor = version === undefined ? null : document.querySelector<HTMLElement>(".editor-dialog")?.getBoundingClientRect();
       const target = availableViewportCenter(viewport, editor);
       const translation = translationToCenter(current, target, graph.getZoom());
-      if (Math.hypot(...translation) < 0.5) return;
+      if (Math.hypot(...translation) < 0.5) return true;
       await graph.translateBy(translation, animation);
+      return true;
     };
     centerControllerRef.current = (version) => {
       const generation = ++cameraGenerationRef.current;
@@ -479,7 +615,7 @@ function VersionCanvas({
       const updates = entries.flatMap((entry) => {
         const node = entry.target as HTMLElement;
         const version = node.dataset.version;
-        const id = version === "working" ? "working" : version ? `version-${version}` : "";
+      const id = version === "working" ? "working" : version ? `revision-${version}` : "";
         const height = Math.round(node.offsetHeight);
         if (!id || !height || Math.abs((measuredHeights.get(id) || 0) - height) < 2) return [];
         measuredHeights.set(id, height);
@@ -522,8 +658,9 @@ function VersionCanvas({
     const onPointerDown = (event: PointerEvent) => {
       cancelAnimationFrame(inertiaFrame);
       const target = event.target instanceof Element ? event.target : null;
+      if (target?.closest(".carousel-control")) { pointerDragRef.current.pointerId = -1; return; }
       const version = target?.closest<HTMLElement>(".version-node")?.dataset.version;
-      const nodeId = version === "working" ? "working" : version ? `version-${version}` : "";
+      const nodeId = version === "working" ? "working" : version ? `revision-${version}` : "";
       pointerDragRef.current = { button: event.button, pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, x: event.clientX, y: event.clientY, moved: false, captured: false, nodeId, vx: 0, vy: 0, additive: event.ctrlKey || event.metaKey, initialSelected: [...selectedRef.current], selectionBox: null };
     };
     const onPointerMove = (event: PointerEvent) => {
@@ -630,9 +767,9 @@ function VersionCanvas({
       const pointer = { targetType: drag.nodeId ? "node" : "canvas", button: drag.button, buttons: drag.button === 2 ? 2 : 1 };
       if (drag.moved && pointerDragAction(modeRef.current, pointer) === "canvas") startCanvasInertia(drag);
       if (drag.button !== 0 || drag.moved || !drag.nodeId) return;
-      const version = drag.nodeId === "working" ? null : Number(drag.nodeId.replace("version-", ""));
+      const version = drag.nodeId === "working" ? null : Number(drag.nodeId.replace("revision-", ""));
       if (version != null && (event.ctrlKey || event.metaKey)) {
-        const current = graph.getElementDataByState("node", "selected").map((item) => Number(String(item.id).replace("version-", ""))).filter(Number.isFinite);
+        const current = graph.getElementDataByState("node", "selected").map((item) => Number(String(item.id).replace("revision-", ""))).filter(Number.isFinite);
         callbacks.current.onSelected(current.includes(version) ? current.filter((item) => item !== version) : [...current, version]);
         return;
       }
@@ -659,6 +796,7 @@ function VersionCanvas({
     };
     const onClick = (event: MouseEvent) => {
       const target = event.target instanceof Element ? event.target : null;
+      if (target?.closest(".carousel-control")) return;
       const action = pointerClickAction(pointerDragRef.current.moved, Boolean(target?.closest(".version-node")));
       if (action === "suppress") {
         event.preventDefault();
@@ -683,27 +821,31 @@ function VersionCanvas({
     graph.on(NodeEvent.CONTEXT_MENU, (rawEvent) => {
       const event = rawEvent as unknown as GraphEventLike;
       const id = event.target?.id || "";
-      callbacks.current.onContext(id === "working" ? "working" : Number(id.replace("version-", "")));
+      callbacks.current.onContext(id === "working" ? "working" : Number(id.replace("revision-", "")));
     });
     graph.on(CanvasEvent.CONTEXT_MENU, () => callbacks.current.onContext(null));
     const focusGraph = async (expectedCameraGeneration = cameraGenerationRef.current) => {
-      if (disposed || cameraGenerationRef.current !== expectedCameraGeneration) return;
+      if (disposed || cameraGenerationRef.current !== expectedCameraGeneration) return false;
       graph.resize();
       const currentPreferences = preferencesRef.current;
-      if (disposed || cameraGenerationRef.current !== expectedCameraGeneration || !graphDataRef.current.nodes.length) return;
+      if (disposed || cameraGenerationRef.current !== expectedCameraGeneration) return false;
+      if (!graphDataRef.current.nodes.length) return true;
       const viewport = container.getBoundingClientRect();
       const origin: [number, number] = [viewport.width / 2, viewport.height / 2];
       if (currentPreferences.autoFit) {
         await graph.fitView({ when: "overflow" });
-        if (disposed || cameraGenerationRef.current !== expectedCameraGeneration) return;
+        if (disposed || cameraGenerationRef.current !== expectedCameraGeneration) return false;
         if (graph.getZoom() > currentPreferences.initialZoom) await graph.zoomTo(currentPreferences.initialZoom, false, origin);
       } else {
         await graph.zoomTo(zoomRef.current, false, origin);
       }
-      if (disposed || cameraGenerationRef.current !== expectedCameraGeneration) return;
+      if (disposed || cameraGenerationRef.current !== expectedCameraGeneration) return false;
       syncReactNodeViewport(container, graph);
-      await centerRenderedCards(undefined, false);
+      const centered = await centerRenderedCards(undefined, false);
+      if (!centered) return false;
+      if (disposed || cameraGenerationRef.current !== expectedCameraGeneration) return false;
       zoomTarget = graph.getZoom();
+      return true;
     };
     let refreshGeneration = 0;
     refreshControllerRef.current = () => {
@@ -736,22 +878,29 @@ function VersionCanvas({
         .catch(() => undefined);
     };
     let focusTimer = 0;
-    const focusWhenReady = (attempt = 0, expectedCameraGeneration = cameraGenerationRef.current) => {
+    const focusWhenReady = (attempt = 0, expectedCameraGeneration = cameraGenerationRef.current, reveal = false) => {
       if (disposed) return;
       const renderedNodeCount = containerRef.current?.querySelectorAll(".version-node").length || 0;
-      if (renderedNodeCount < graphDataRef.current.nodes.length && attempt < 20) {
-        focusTimer = window.setTimeout(() => focusWhenReady(attempt + 1, expectedCameraGeneration), 50);
+      if (renderedNodeCount < graphDataRef.current.nodes.length) {
+        focusTimer = window.setTimeout(() => focusWhenReady(attempt + 1, expectedCameraGeneration, reveal), 50);
         return;
       }
       observeNodeSizes();
       void focusGraph(expectedCameraGeneration)
-        .then(() => {
+        .then((positioned) => {
           if (disposed) return;
+          if (!positioned) {
+            if (reveal) focusTimer = window.setTimeout(() => focusWhenReady(0, cameraGenerationRef.current, true), 0);
+            return;
+          }
           syncHtmlGraph();
           syncReactNodeViewport(container, graph);
           callbacks.current.onZoomChange(graph.getZoom());
+          if (reveal) revealGraph();
         })
-        .catch(() => undefined);
+        .catch(() => {
+          if (!disposed && reveal) focusTimer = window.setTimeout(() => focusWhenReady(0, cameraGenerationRef.current, true), 50);
+        });
     };
     const initialCameraGeneration = cameraGenerationRef.current;
     void graph.render()
@@ -759,11 +908,12 @@ function VersionCanvas({
         if (disposed) return;
         lastGraphContentKeyRef.current = graphContentKey;
         setGraphReady(true);
-        focusWhenReady(0, initialCameraGeneration);
+        focusWhenReady(0, initialCameraGeneration, true);
       })
       .catch(() => undefined);
     let resizeTimer = 0;
     const resizeObserver = new ResizeObserver(() => {
+      if (!graphPositionedRef.current) return;
       const resizeCameraGeneration = ++cameraGenerationRef.current;
       clearTimeout(resizeTimer);
       resizeTimer = window.setTimeout(() => focusWhenReady(0, resizeCameraGeneration), 240);
@@ -822,10 +972,10 @@ function VersionCanvas({
     const graph = graphRef.current;
     const container = containerRef.current;
     if (!graphReady || !graph || !container) return;
-    const lineage = ancestorsOf(theme.versions, selected);
+    const lineage = ancestorsOf(theme.revisions, selected);
     const states: Record<string, string[]> = {};
     for (const node of graphData.nodes) {
-      const version = node.id === "working" ? null : Number(String(node.id).replace("version-", ""));
+      const version = node.id === "working" ? null : Number(String(node.id).replace("revision-", ""));
       states[String(node.id)] = selected.includes(version as number) ? ["selected"] : selected.length && version != null && !lineage.has(version) ? ["dimmed"] : version != null && lineage.has(version) ? ["lineage"] : [];
     }
     for (const edge of graphData.edges) {
@@ -834,7 +984,7 @@ function VersionCanvas({
     }
     graph.setElementState(states, false);
     graph.updateNodeData(graphData.nodes.map((node) => {
-      const version = node.id === "working" ? null : Number(String(node.id).replace("version-", ""));
+      const version = node.id === "working" ? null : Number(String(node.id).replace("revision-", ""));
       return {
         id: node.id,
         data: {
@@ -852,9 +1002,9 @@ function VersionCanvas({
       syncReactNodeViewport(container, graph);
     });
     return () => { cancelled = true; };
-  }, [selected, theme.versions, graphReady]);
+  }, [selected, graphVisualKey, graphReady]);
 
-  return <div className="graph-stage"><div className={`graph-canvas ${mode}`} ref={containerRef} /></div>;
+  return <div className="graph-stage"><div className={`graph-canvas ${mode} ${graphPositioned ? "positioned" : "positioning"}`} ref={containerRef} /></div>;
 }
 
 type AssetQueueItem =
@@ -1041,17 +1191,21 @@ function EditorDialog({
   const [assetOrder, setAssetOrder] = useState<{ reference: string[]; result: string[] }>({ reference: [], result: [] });
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
+  const [titleDialogOpen, setTitleDialogOpen] = useState(false);
+  const [titleDraft, setTitleDraft] = useState("");
   const initialDraft = useRef("");
   const initializedEditor = useRef("");
   const editorDialogRef = useRef<HTMLDivElement>(null);
+  const titleInputRef = useRef<HTMLInputElement>(null);
+  const titleEditButtonRef = useRef<HTMLButtonElement>(null);
   const activeSessionRef = useRef(sessionId);
   const editorOpenRef = useRef(open);
   const savingRef = useRef(false);
   const draftHistory = useRef<{ past: EditorDraft[]; future: EditorDraft[] }>({ past: [], future: [] });
   activeSessionRef.current = sessionId;
   editorOpenRef.current = open;
-  const detailQuery = useQuery({ queryKey: ["version", theme.slug, version], queryFn: () => api.version(theme.slug, version!), enabled: open && version != null });
-  const currentAssets = version == null ? theme.assets : detailQuery.data?.assets || { reference: [], result: [] };
+  const detailQuery = useQuery({ queryKey: ["revision", theme.slug, version], queryFn: () => api.revision(theme.slug, version!), enabled: open && version != null });
+  const currentAssets = version == null ? theme.draft.assets : detailQuery.data?.draft.assets || { reference: [], result: [] };
   const editorKey = `${sessionId}:${theme.slug}:${version ?? "working"}:${initialIntent || ""}:${initialParents.join(",")}`;
   const updateDraft = (update: EditorDraft | ((current: EditorDraft) => EditorDraft)) => {
     setDraft((current) => {
@@ -1085,16 +1239,16 @@ function EditorDialog({
     }
     if (initializedEditor.current === editorKey) return;
     if (!open || (version != null && !detailQuery.data)) return;
-    const source: Theme | VersionDetail = version == null ? theme : detailQuery.data!;
+    const source = version == null ? theme.draft : detailQuery.data!.draft;
     const nextIntent = initialEditorIntent(version, initialIntent);
     const nextDraft = {
-      change_note: version == null || nextIntent === "grow" ? "" : (source as VersionDetail).change_note || "",
+      note: nextIntent === "saveRevision" ? "" : version == null ? theme.workingTitle : theme.revisions.find((revision) => revision.id === version)?.note || detailQuery.data?.note || "",
       prompt: source.prompt || "",
       negative: source.negative || "",
       notes: source.notes || "",
       model: source.model || "",
       params: source.params || "",
-      parents: initialParents.length ? initialParents : version != null ? [version] : theme.working_base != null ? [theme.working_base] : [],
+      parentIds: initialParents.length ? initialParents : version != null ? [version] : theme.baseRevision != null ? [theme.baseRevision] : [],
     };
     initializedEditor.current = editorKey;
     initialDraft.current = JSON.stringify(nextDraft);
@@ -1108,7 +1262,13 @@ function EditorDialog({
       result: sourceAssets.result.map((_, index) => `existing:${index}`),
     });
     setError("");
+    setTitleDialogOpen(false);
   }, [open, version, detailQuery.data, initialIntent, editorKey]);
+  useEffect(() => {
+    if (!titleDialogOpen) return;
+    titleInputRef.current?.focus();
+    titleInputRef.current?.select();
+  }, [titleDialogOpen]);
   useEffect(() => {
     const loading = version != null && !detailQuery.data;
     onDirtyChange(open && !loading && (
@@ -1119,45 +1279,44 @@ function EditorDialog({
     ));
   }, [open, version, detailQuery.data, draft, assetFiles, removedAssets, assetOrder, onDirtyChange]);
 
-  const save = async (targetIntent: EditorIntent = "overwrite") => {
-    if (savingRef.current || !canStartSave() || !canSaveEditor(version, targetIntent, draft, theme.can_create_root)) return;
+  const save = async (targetIntent: EditorIntent = "updateDraft") => {
+    if (savingRef.current || !canStartSave() || !canSaveEditor(version, targetIntent, draft, theme.revisionCount === 0)) return;
     const requestedSession = sessionId;
     savingRef.current = true;
     onSavingChange(true);
     setSaving(true);
     try {
-      let result: Theme;
-      const toApiOrder = (kind: "reference" | "result"): AssetOrderEntry[] => {
-        const existing = currentAssets[kind];
-        const entries: AssetOrderEntry[] = [];
-        assetOrder[kind].forEach((id) => {
-          if (id.startsWith("upload:")) {
-            entries.push({ source: "upload", index: Number(id.slice(7)) });
-            return;
-          }
-          const index = Number(id.slice(9));
-          if (index >= 0 && index < existing.length) entries.push({ source: "existing", index });
-        });
-        return entries;
+      const assets = Object.fromEntries((["reference", "result"] as const).map((kind) => [kind, {
+        remove: currentAssets[kind].flatMap((asset, index) => removedAssets[kind].has(`existing:${index}`) ? [asset.name] : []),
+        order: assetOrder[kind].map((id) => id.startsWith("existing:")
+          ? { source: "existing", index: Number(id.slice(9)) }
+          : { source: "upload", index: Number(id.slice(7)) }),
+      }]));
+      const edit = {
+        sourceRevisionId: version ?? undefined,
+        force: false,
+        nodeTitle: version == null && targetIntent === "updateDraft" ? draft.note : undefined,
+        update: { prompt: draft.prompt, negative: draft.negative, notes: draft.notes, model: draft.model, params: draft.params },
+        assets,
+        saveRevision: targetIntent === "saveRevision" ? { note: draft.note, parentIds: draft.parentIds } : undefined,
       };
-      const orderedAssets = { reference: toApiOrder("reference"), result: toApiOrder("result") };
-      if (targetIntent === "overwrite") {
-        if (version != null) {
-          result = await api.overwriteVersion(theme.slug, version, draft, assetFiles, orderedAssets);
-        } else {
-          result = await api.updateTheme(theme.slug, draft);
-          if (assetFiles.reference.length) result = await api.uploadAssets(theme.slug, "reference", assetFiles.reference);
-          if (assetFiles.result.length) result = await api.uploadAssets(theme.slug, "result", assetFiles.result);
-        }
+      let result: Theme;
+      const operation = editorSaveOperation(version, targetIntent);
+      if (operation === "overwriteRevision") {
+        result = await api.overwriteRevision(theme.slug, version!, {
+          note: draft.note,
+          update: edit.update,
+          assets,
+        }, assetFiles);
       } else {
         try {
-          result = await api.grow(theme.slug, draft, assetFiles, orderedAssets);
+          result = await api.applyDraftEdit(theme.slug, edit, assetFiles);
         } catch (caught) {
-          if (!(caught instanceof Error) || !caught.message.includes("uncommitted changes") || !confirm("当前节点有未保存修改。继续演变会用新节点替换当前内容，是否继续？")) throw caught;
-          result = await api.grow(theme.slug, draft, assetFiles, orderedAssets, true);
+          if (!(caught instanceof Error) || !caught.message.includes("unsaved Draft changes") || !confirm("当前节点有未保存修改。是否丢弃这些修改并继续？")) throw caught;
+          result = await api.applyDraftEdit(theme.slug, { ...edit, force: true }, assetFiles);
         }
       }
-      if (version != null) await queryClient.invalidateQueries({ queryKey: ["version", theme.slug, version] });
+      if (version != null) await queryClient.invalidateQueries({ queryKey: ["revision", theme.slug, version] });
       if (!editorOpenRef.current || activeSessionRef.current !== requestedSession) return;
       onSaved(result);
       onDirtyChange(false);
@@ -1170,6 +1329,17 @@ function EditorDialog({
       onSavingChange(false);
       setSaving(false);
     }
+  };
+  const titlePlaceholder = version == null ? "节点说明" : `默认 ${detailQuery.data?.digest.slice(0, 6) || "------"}`;
+  const editTitle = () => {
+    setTitleDraft(draft.note);
+    setTitleDialogOpen(true);
+  };
+  const renameTitle = () => {
+    const title = titleDraft.trim();
+    if (!title) return;
+    updateDraft((current) => ({ ...current, note: title }));
+    setTitleDialogOpen(false);
   };
 
   useEffect(() => {
@@ -1192,16 +1362,16 @@ function EditorDialog({
       const multiline = event.target instanceof HTMLTextAreaElement;
       if (multiline && !event.ctrlKey) return;
       event.preventDefault();
-      void save(event.shiftKey ? "grow" : "overwrite");
+      void save(event.shiftKey ? "saveRevision" : "updateDraft");
     };
     addEventListener("keydown", onKeyDown);
     return () => removeEventListener("keydown", onKeyDown);
-  }, [open, draft, assetFiles, assetOrder, removedAssets, version, theme.can_create_root]);
+  }, [open, draft, assetFiles, assetOrder, removedAssets, version, theme.revisionCount]);
 
   return (
     <Dialog.Root modal={false} open={open}>
       <Dialog.Portal>
-        <Dialog.Content asChild onPointerDownOutside={(event) => {
+        <Dialog.Content asChild onOpenAutoFocus={(event) => event.preventDefault()} onPointerDownOutside={(event) => {
           const target = event.target instanceof Element ? event.target : null;
           if (target?.closest(".version-node")) event.preventDefault();
         }} onInteractOutside={(event) => {
@@ -1211,36 +1381,50 @@ function EditorDialog({
         <motion.div ref={editorDialogRef} className={`dialog-content editor-dialog ${version != null && !detailQuery.data ? "loading" : ""}`} initial={reduceMotion ? false : { opacity: 0, x: 28, scale: 0.985 }} animate={{ opacity: 1, x: 0, scale: 1 }} transition={reduceMotion ? { duration: 0 } : { type: "spring", stiffness: 360, damping: 34, mass: 0.72 }}>
           <div className="editor-header">
             <Dialog.Title className="sr-only">{version == null ? "节点" : `节点 #${String(version).padStart(4, "0")}`}</Dialog.Title>
-            <label className="editor-title-block" htmlFor="node-title">
+            <div className="editor-title-block">
               <span className="node-title-label">节点标题</span>
-              <Input id="node-title" className="node-title-input" value={draft.change_note} placeholder={version == null ? "输入标题" : `自动名称 ${detailQuery.data?.digest.slice(0, 6) || "------"}`} onChange={(event) => updateDraft({ ...draft, change_note: event.target.value })} />
-            </label>
+              <div className="node-title-row">
+                <strong className="node-title-display">{draft.note.trim() || titlePlaceholder}</strong>
+                <IconButton ref={titleEditButtonRef} className="node-title-edit" label="修改节点标题" onClick={editTitle}><Pencil size={15} /></IconButton>
+              </div>
+            </div>
             <Dialog.Description className="sr-only">编辑节点内容和图片</Dialog.Description>
             <button className="dialog-close" aria-label="关闭" onClick={() => onClose()}><X size={18} /></button>
           </div>
           <div className="editor-scroll">
-            <div className="asset-inputs">
-              <AssetPicker label="参考图" files={assetFiles.reference} current={currentAssets.reference} removed={removedAssets.reference} order={assetOrder.reference} editableExisting={version != null} reorderable={version != null} onFiles={(files) => setAssetFiles({ ...assetFiles, reference: files })} onRemoved={(removed) => setRemovedAssets({ ...removedAssets, reference: removed })} onOrder={(order) => setAssetOrder({ ...assetOrder, reference: order })} />
-              <AssetPicker label="生成结果" files={assetFiles.result} current={currentAssets.result} removed={removedAssets.result} order={assetOrder.result} editableExisting={version != null} reorderable={version != null} onFiles={(files) => setAssetFiles({ ...assetFiles, result: files })} onRemoved={(removed) => setRemovedAssets({ ...removedAssets, result: removed })} onOrder={(order) => setAssetOrder({ ...assetOrder, result: order })} />
-            </div>
-            <label>提示词<Textarea className="prompt-textarea" value={draft.prompt} onChange={(event) => updateDraft({ ...draft, prompt: event.target.value })} /></label>
-            <label>负面提示词<Textarea className="compact-textarea" value={draft.negative} onChange={(event) => updateDraft({ ...draft, negative: event.target.value })} /></label>
-            <label>模型<Input value={draft.model} onChange={(event) => updateDraft({ ...draft, model: event.target.value })} /></label>
-            <label>参数<Textarea rows={4} value={draft.params} onChange={(event) => updateDraft({ ...draft, params: event.target.value })} /></label>
-            <label>备注<Textarea rows={8} value={draft.notes} onChange={(event) => updateDraft({ ...draft, notes: event.target.value })} /></label>
+            <section className="editor-section">
+              <div className="asset-inputs">
+                <AssetPicker label="参考图" files={assetFiles.reference} current={currentAssets.reference} removed={removedAssets.reference} order={assetOrder.reference} editableExisting reorderable onFiles={(files) => setAssetFiles({ ...assetFiles, reference: files })} onRemoved={(removed) => setRemovedAssets({ ...removedAssets, reference: removed })} onOrder={(order) => setAssetOrder({ ...assetOrder, reference: order })} />
+                <AssetPicker label="生成结果" files={assetFiles.result} current={currentAssets.result} removed={removedAssets.result} order={assetOrder.result} editableExisting reorderable onFiles={(files) => setAssetFiles({ ...assetFiles, result: files })} onRemoved={(removed) => setRemovedAssets({ ...removedAssets, result: removed })} onOrder={(order) => setAssetOrder({ ...assetOrder, result: order })} />
+              </div>
+            </section>
+            <section className="editor-section"><label>提示词<Textarea className="prompt-textarea code-textarea" value={draft.prompt} onChange={(event) => updateDraft({ ...draft, prompt: event.target.value })} /></label><label>负面提示词<Textarea className="compact-textarea code-textarea" value={draft.negative} onChange={(event) => updateDraft({ ...draft, negative: event.target.value })} /></label></section>
+            <section className="editor-section"><label>模型<Input value={draft.model} onChange={(event) => updateDraft({ ...draft, model: event.target.value })} /></label><label>参数<Textarea className="code-textarea" rows={4} value={draft.params} onChange={(event) => updateDraft({ ...draft, params: event.target.value })} /></label></section>
+            <section className="editor-section"><label>备注<Textarea rows={8} value={draft.notes} onChange={(event) => updateDraft({ ...draft, notes: event.target.value })} /></label></section>
           </div>
           {error && <p className="form-error">{error}</p>}
-          <div className="editor-footer"><div className="dialog-actions"><Button className="editor-action-button" variant="secondary" onClick={() => onClose()}>取消</Button><Button className="editor-action-button" variant="secondary" disabled={saving || saveBlocked || !canSaveEditor(version, "grow", draft, theme.can_create_root)} onClick={() => void save("grow")}>创建</Button><Button className="editor-action-button" variant="secondary" disabled={saving || saveBlocked || !canSaveEditor(version, "overwrite", draft, theme.can_create_root)} onClick={() => void save("overwrite")}>覆盖</Button></div></div>
+           <div className="editor-footer"><div className="dialog-actions"><Button className="editor-action-button" variant="ghost" disabled={saving || saveBlocked || !canSaveEditor(version, "updateDraft", draft)} onClick={() => void save("updateDraft")}>保存</Button><Button className="editor-action-button" variant="ghost" disabled={saving || saveBlocked || !canSaveEditor(version, "saveRevision", draft)} onClick={() => void save("saveRevision")}>另存</Button><Button className="editor-action-button" variant="ghost" onClick={() => onClose()}>取消</Button></div></div>
         </motion.div>
         </Dialog.Content>
       </Dialog.Portal>
+      <Dialog.Root open={titleDialogOpen} onOpenChange={setTitleDialogOpen}>
+        <Dialog.Portal>
+          <Dialog.Overlay className="dialog-overlay title-dialog-overlay" />
+          <Dialog.Content className="dialog-content title-dialog" onCloseAutoFocus={(event) => { event.preventDefault(); titleEditButtonRef.current?.focus(); }}>
+            <Dialog.Title>修改节点标题</Dialog.Title>
+            <Dialog.Description>输入新的节点标题。</Dialog.Description>
+            <Input ref={titleInputRef} id="node-title" value={titleDraft} placeholder={titlePlaceholder} onChange={(event) => setTitleDraft(event.target.value)} onKeyDown={(event) => { if (event.nativeEvent.isComposing || event.key !== "Enter") return; event.preventDefault(); renameTitle(); }} />
+            <div className="dialog-actions"><Button variant="ghost" onClick={() => setTitleDialogOpen(false)}>取消</Button><Button disabled={!titleDraft.trim()} onClick={renameTitle}>确认</Button></div>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
     </Dialog.Root>
   );
 }
 
 function Comparator({ comparison, open, onClose }: { comparison: Comparison | null; open: boolean; onClose: () => void }) {
-  const leftImage = comparison?.left.assets.result[0]?.url || comparison?.left.assets.reference[0]?.url;
-  const rightImage = comparison?.right.assets.result[0]?.url || comparison?.right.assets.reference[0]?.url;
+  const leftImage = comparison?.left.draft.assets.result[0]?.url || comparison?.left.draft.assets.reference[0]?.url;
+  const rightImage = comparison?.right.draft.assets.result[0]?.url || comparison?.right.draft.assets.reference[0]?.url;
   return (
     <Dialog.Root open={open} onOpenChange={(value) => !value && onClose()}>
       <Dialog.Portal>
@@ -1249,9 +1433,9 @@ function Comparator({ comparison, open, onClose }: { comparison: Comparison | nu
           <header className="compare-header"><Dialog.Title>节点比较</Dialog.Title><Dialog.Description className="sr-only">并排查看两个节点的成图和提示词差异。</Dialog.Description><Dialog.Close asChild><button className="dialog-close" aria-label="关闭"><X size={18} /></button></Dialog.Close></header>
           {comparison && <>
             <div className="image-compare">
-              {[{ detail: comparison.left, image: leftImage }, { detail: comparison.right, image: rightImage }].map(({ detail, image }) => <figure key={detail.version}>{image ? <img src={image} alt="" /> : <div className="compare-empty"><ImageIcon /></div>}<figcaption>#{String(detail.version).padStart(4, "0")} · {detail.change_note}</figcaption></figure>)}
+              {[{ detail: comparison.left, image: leftImage }, { detail: comparison.right, image: rightImage }].map(({ detail, image }) => <figure key={detail.id}>{image ? <img src={image} alt="" /> : <div className="compare-empty"><ImageIcon /></div>}<figcaption>R{String(detail.id).padStart(4, "0")} · {detail.note}</figcaption></figure>)}
             </div>
-            <div className="diff-pane"><Suspense fallback={<div className="diff-loading">DIFF</div>}><ComparatorDiff original={comparison.left.prompt} modified={comparison.right.prompt} /></Suspense></div>
+            <div className="diff-pane"><Suspense fallback={<div className="diff-loading">DIFF</div>}><ComparatorDiff original={comparison.left.draft.prompt} modified={comparison.right.draft.prompt} /></Suspense></div>
           </>}
         </Dialog.Content>
       </Dialog.Portal>
@@ -1259,45 +1443,119 @@ function Comparator({ comparison, open, onClose }: { comparison: Comparison | nu
   );
 }
 
-function downloadShareCard(theme: Theme, version: VersionDetail) {
+function drawWrappedText(context: CanvasRenderingContext2D, text: string, x: number, y: number, maxWidth: number, lineHeight: number, maxLines: number) {
+  const characters = Array.from(text.replace(/\s+/g, " ").trim());
+  const lines: string[] = [];
+  let line = "";
+  let consumed = 0;
+  for (const character of characters) {
+    const next = `${line}${character}`;
+    if (context.measureText(next).width > maxWidth && line) {
+      lines.push(line);
+      line = character.trimStart();
+    } else {
+      line = next;
+    }
+    consumed += 1;
+    if (lines.length === maxLines) break;
+  }
+  if (line && lines.length < maxLines) lines.push(line);
+  if (lines.length === maxLines && consumed < characters.length) {
+    while (context.measureText(`${lines[maxLines - 1]}...`).width > maxWidth) lines[maxLines - 1] = lines[maxLines - 1].slice(0, -1);
+    lines[maxLines - 1] = `${lines[maxLines - 1]}...`;
+  }
+  lines.forEach((value, index) => context.fillText(value, x, y + index * lineHeight));
+}
+
+function loadShareImage(url: string) {
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("成图加载失败"));
+    image.src = url;
+  });
+}
+
+async function downloadShareCard(theme: Theme, revision: Revision) {
+  const result = revision.draft.assets.result[0];
+  if (!result) throw new Error("该节点没有可用于分享的成图");
+  const image = await loadShareImage(result.url);
   const canvas = document.createElement("canvas");
   canvas.width = 1200;
   canvas.height = 630;
   const context = canvas.getContext("2d")!;
-  context.fillStyle = "#f9f9fa";
+  context.fillStyle = "#f5f6f7";
   context.fillRect(0, 0, canvas.width, canvas.height);
-  context.fillStyle = "#18191c";
-  context.font = "600 34px Segoe UI";
-  context.fillText(theme.title, 56, 72);
-  context.font = "500 18px Segoe UI";
-  context.fillStyle = "#62676d";
-  context.fillText(`#${String(version.version).padStart(4, "0")}  ${version.change_note}`, 56, 108);
+
+  const standardPrompt = fitCanvasText(context, revision.draft.prompt, {
+    maxWidth: 460,
+    maxHeight: 286,
+    maxFontSize: 18,
+    minFontSize: 8,
+    lineHeightRatio: 1.35,
+    fontFamily: "Consolas",
+  });
+  const compact = !standardPrompt.fits;
+  const imagePanelWidth = compact ? 260 : 600;
+  const panelX = imagePanelWidth;
+  const contentX = panelX + (compact ? 40 : 48);
+  const contentWidth = 1200 - contentX - 48;
+  const promptBoxY = compact ? 150 : 194;
+  const promptBoxHeight = compact ? 400 : 330;
+  const promptInset = 22;
+  const promptLayout = compact ? fitCanvasText(context, revision.draft.prompt, {
+    maxWidth: contentWidth - promptInset * 2,
+    maxHeight: promptBoxHeight - promptInset * 2,
+    maxFontSize: 13,
+    minFontSize: 0.5,
+    lineHeightRatio: 1.25,
+    fontFamily: "Consolas",
+  }) : standardPrompt;
+
+  const imageScale = Math.max(imagePanelWidth / image.naturalWidth, 630 / image.naturalHeight);
+  const imageWidth = image.naturalWidth * imageScale;
+  const imageHeight = image.naturalHeight * imageScale;
+  context.drawImage(image, (imagePanelWidth - imageWidth) / 2, (630 - imageHeight) / 2, imageWidth, imageHeight);
+
   context.fillStyle = "#ffffff";
-  context.fillRect(56, 146, 1088, 418);
-  context.strokeStyle = "#e5e5e5";
-  context.strokeRect(56.5, 146.5, 1087, 417);
+  context.fillRect(panelX, 0, 1200 - panelX, 630);
   context.fillStyle = "#18191c";
-  context.font = "24px Consolas";
-  const words = version.prompt.split(/\s+/);
-  const lines: string[] = [];
-  let line = "";
-  for (const word of words) {
-    const next = `${line} ${word}`.trim();
-    if (context.measureText(next).width > 980) { lines.push(line); line = word; } else line = next;
-    if (lines.length === 8) break;
-  }
-  if (line && lines.length < 9) lines.push(line);
-  lines.forEach((text, index) => context.fillText(text, 92, 205 + index * 38));
-  context.font = "500 17px Consolas";
+  context.fillRect(contentX, compact ? 30 : 42, 34, 34);
+  context.fillStyle = "#ffffff";
+  context.font = "700 14px Segoe UI";
+  context.fillText("PV", contentX + 7, compact ? 53 : 65);
+  context.fillStyle = "#18191c";
+  context.font = "650 16px Segoe UI";
+  context.fillText("Prompt Vault", contentX + 46, compact ? 53 : 65);
+
+  context.font = compact ? "650 26px Segoe UI" : "650 31px Segoe UI";
+  drawWrappedText(context, `R${String(revision.id).padStart(4, "0")}  ${revision.note}`, contentX, compact ? 105 : 128, contentWidth, 38, 1);
+  context.font = "500 17px Segoe UI";
+  context.fillStyle = "#62676d";
+  drawWrappedText(context, theme.title, contentX, compact ? 135 : 160, contentWidth, 22, 1);
+
+  context.fillStyle = "#f7f7f8";
+  context.beginPath();
+  context.roundRect(contentX, promptBoxY, contentWidth, promptBoxHeight, 8);
+  context.fill();
+  context.strokeStyle = "#e5e5e5";
+  context.stroke();
+  context.fillStyle = "#18191c";
+  context.font = `${promptLayout.fontSize}px Consolas`;
+  promptLayout.lines.forEach((line, index) => {
+    context.fillText(line, contentX + promptInset, promptBoxY + promptInset + promptLayout.fontSize + index * promptLayout.lineHeight);
+  });
+
+  context.font = "500 15px Consolas";
   context.fillStyle = "#0055ff";
-  context.fillText(`${version.model || "MODEL -"}   ${version.params || ""}`, 92, 530);
+  drawWrappedText(context, `${revision.draft.model || "MODEL -"}   ${revision.draft.params || ""}`, contentX, 582, contentWidth, 22, 2);
   const anchor = document.createElement("a");
-  anchor.download = `${theme.slug}-${version.version}.png`;
+  anchor.download = `${theme.slug}-revision-${revision.id}.png`;
   anchor.href = canvas.toDataURL("image/png");
   anchor.click();
 }
 
-type SettingsTab = "theme" | "canvas" | "shortcuts";
+type SettingsTab = "theme" | "canvas" | "carousel" | "shortcuts";
 
 const settingsNavigation: { group: string; tabs: { id: SettingsTab; label: string; description: string; icon: typeof FilePlus2 }[] }[] = [
   {
@@ -1305,6 +1563,7 @@ const settingsNavigation: { group: string; tabs: { id: SettingsTab; label: strin
     tabs: [
       { id: "theme", label: "主题", description: "名称、描述与标签", icon: FilePlus2 },
       { id: "canvas", label: "画布", description: "视图与节点显示", icon: Maximize2 },
+      { id: "carousel", label: "轮播", description: "节点图片播放行为", icon: ImageIcon },
     ],
   },
   {
@@ -1319,8 +1578,8 @@ const shortcutGroups = [
   {
     title: "节点编辑器",
     items: [
-      { label: "覆盖当前节点", description: "保存修改到当前节点", keys: ["Enter"] },
-      { label: "创建子节点", description: "从当前内容创建新的演变节点", keys: ["Shift", "Enter"] },
+      { label: "保存", description: "覆盖更新当前节点", keys: ["Enter"] },
+      { label: "另存", description: "将修改存为当前节点的子节点", keys: ["Shift", "Enter"] },
       { label: "撤销编辑", description: "撤销上一次字段修改", keys: ["Ctrl Z"] },
       { label: "重做编辑", description: "恢复上一次撤销的字段修改", keys: ["Ctrl R"] },
     ],
@@ -1332,42 +1591,92 @@ function SettingsDialog({
   preferences,
   open,
   onClose,
-  onSave,
+  onThemeChange,
+  onPreferencesChange,
 }: {
   theme: Theme;
   preferences: WorkspacePreferences;
   open: boolean;
   onClose: () => void;
-  onSave: (theme: Partial<Theme>, preferences: WorkspacePreferences) => Promise<void>;
+  onThemeChange: (theme: Partial<Theme>) => Promise<void>;
+  onPreferencesChange: (preferences: WorkspacePreferences) => void;
 }) {
-  const [themeDraft, setThemeDraft] = useState({ title: theme.title, description: theme.description, tags: theme.tags.join(", ") });
+  const [themeDraft, setThemeDraft] = useState({ title: theme.title, category: theme.category, description: theme.description, tags: theme.tags.join(", ") });
   const [preferenceDraft, setPreferenceDraft] = useState(preferences);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [tab, setTab] = useState<SettingsTab>("theme");
   const [search, setSearch] = useState("");
+  const queuedThemeRef = useRef("");
+  const saveQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const pendingSavesRef = useRef(0);
+  const hydratingRef = useRef(false);
+  const latestThemeDraftRef = useRef(themeDraft);
+  const hasUnsyncedThemeRef = useRef(false);
+  latestThemeDraftRef.current = themeDraft;
+  const themePayload = (draft = themeDraft) => ({
+    title: draft.title.trim(),
+    category: draft.category.trim(),
+    description: draft.description.trim(),
+    tags: draft.tags.split(/[,，]/).map((tag) => tag.trim()).filter(Boolean),
+  });
+  const queueThemeSave = (draft = latestThemeDraftRef.current) => {
+    const payload = themePayload(draft);
+    const serialized = JSON.stringify(payload);
+    if (!payload.title) return;
+    if (serialized === queuedThemeRef.current) {
+      if (pendingSavesRef.current === 0) hasUnsyncedThemeRef.current = false;
+      return;
+    }
+    queuedThemeRef.current = serialized;
+    pendingSavesRef.current += 1;
+    setSaving(true);
+    setError("");
+    saveQueueRef.current = saveQueueRef.current.catch(() => undefined).then(() => onThemeChange(payload)).then(() => {
+      if (queuedThemeRef.current === serialized) {
+        hasUnsyncedThemeRef.current = false;
+        setError("");
+      }
+    }).catch((caught) => {
+      if (queuedThemeRef.current === serialized) {
+        queuedThemeRef.current = "";
+        setError(caught instanceof Error ? caught.message : "设置同步失败");
+      }
+    }).finally(() => {
+      pendingSavesRef.current -= 1;
+      if (pendingSavesRef.current === 0) setSaving(false);
+    });
+  };
+  const updatePreferences = (next: WorkspacePreferences) => {
+    setPreferenceDraft(next);
+    onPreferencesChange(next);
+  };
   useEffect(() => {
     if (!open) return;
-    setThemeDraft({ title: theme.title, description: theme.description, tags: theme.tags.join(", ") });
+    const serverDraft = { title: theme.title, category: theme.category, description: theme.description, tags: theme.tags.join(", ") };
+    const next = pendingSavesRef.current > 0 || hasUnsyncedThemeRef.current ? latestThemeDraftRef.current : serverDraft;
+    hydratingRef.current = true;
+    setThemeDraft(next);
+    latestThemeDraftRef.current = next;
+    if (!hasUnsyncedThemeRef.current) queuedThemeRef.current = JSON.stringify(themePayload(next));
     setPreferenceDraft(preferences);
     setSearch("");
     setError("");
-  }, [open, theme.title, theme.description, theme.tags, preferences]);
-  const save = async () => {
-    setSaving(true);
-    setError("");
-    try {
-      await onSave({
-        title: themeDraft.title.trim(),
-        description: themeDraft.description.trim(),
-        tags: themeDraft.tags.split(/[,，]/).map((tag) => tag.trim()).filter(Boolean),
-      }, preferenceDraft);
-      onClose();
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "保存设置失败");
-    } finally {
-      setSaving(false);
-    }
+  }, [open, theme.slug]);
+  useEffect(() => {
+    if (!open) return;
+    if (hydratingRef.current) { hydratingRef.current = false; return; }
+    const timer = window.setTimeout(() => queueThemeSave(themeDraft), 420);
+    return () => clearTimeout(timer);
+  }, [open, themeDraft]);
+  const close = () => {
+    queueThemeSave(latestThemeDraftRef.current);
+    onClose();
+  };
+  const updateThemeDraft = (next: typeof themeDraft) => {
+    latestThemeDraftRef.current = next;
+    hasUnsyncedThemeRef.current = true;
+    setThemeDraft(next);
   };
   const activeTab = settingsNavigation.flatMap((group) => group.tabs).find((item) => item.id === tab)!;
   const filteredNavigation = settingsNavigation.map((group) => ({
@@ -1392,7 +1701,7 @@ function SettingsDialog({
     next.focus();
   };
   return (
-    <Dialog.Root open={open} onOpenChange={(value) => !value && onClose()}>
+    <Dialog.Root open={open} onOpenChange={(value) => !value && close()}>
       <Dialog.Portal>
         <Dialog.Overlay className="dialog-overlay" />
         <Dialog.Content className="dialog-content settings-dialog">
@@ -1403,7 +1712,7 @@ function SettingsDialog({
             <nav className="settings-sidebar" aria-label="设置分类">
               <div className="settings-search">
                 <Search size={14} />
-                <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索设置" aria-label="搜索设置" />
+                <Input className="settings-search-input" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索设置" aria-label="搜索设置" />
               </div>
               <div className="settings-nav" role="tablist" aria-orientation="vertical" onKeyDown={onTabKeyDown}>
                 {filteredNavigation.length ? filteredNavigation.map((group) => (
@@ -1425,17 +1734,17 @@ function SettingsDialog({
             </nav>
             <div className="settings-panel">
               <header className="settings-panel-header">
-                <h2>{activeTab.label}</h2>
-                <p>{activeTab.description}</p>
+                <div><h2>{activeTab.label}</h2><p>{activeTab.description}</p></div>
+                {(saving || error) && <span role={error ? "alert" : "status"} aria-live="polite" className={`settings-sync-state ${error ? "error" : ""}`}>{error || "正在同步..."}</span>}
               </header>
               <div id={`settings-panel-${tab}`} className="settings-content" role="tabpanel" aria-labelledby={`settings-tab-${tab}`}>
                 {tab === "theme" && (
                   <section className="settings-section">
                     <div className="settings-section-heading"><h3>主题信息</h3><p>这些内容会显示在主题库和工作区标题栏。</p></div>
                     <div className="settings-field-list">
-                      <label>名称<Input value={themeDraft.title} onChange={(event) => setThemeDraft({ ...themeDraft, title: event.target.value })} /></label>
-                      <label>描述<Textarea rows={4} value={themeDraft.description} onChange={(event) => setThemeDraft({ ...themeDraft, description: event.target.value })} /></label>
-                      <label>标签<Input value={themeDraft.tags} onChange={(event) => setThemeDraft({ ...themeDraft, tags: event.target.value })} placeholder="用逗号分隔" /></label>
+                      <div className="dialog-field-grid"><label>名称<Input value={themeDraft.title} onChange={(event) => updateThemeDraft({ ...themeDraft, title: event.target.value })} /></label><label>分类<Input value={themeDraft.category} onChange={(event) => updateThemeDraft({ ...themeDraft, category: event.target.value })} placeholder="例如：角色设计" /></label></div>
+                      <label>描述<Textarea rows={4} value={themeDraft.description} onChange={(event) => updateThemeDraft({ ...themeDraft, description: event.target.value })} /></label>
+                      <label>标签<Input value={themeDraft.tags} onChange={(event) => updateThemeDraft({ ...themeDraft, tags: event.target.value })} placeholder="用逗号分隔" /></label>
                     </div>
                   </section>
                 )}
@@ -1444,16 +1753,22 @@ function SettingsDialog({
                     <section className="settings-section">
                       <div className="settings-section-heading"><h3>视图</h3><p>控制工作区初次打开时的尺寸和位置。</p></div>
                       <div className="settings-field-list">
-                        <label className="range-setting"><span>节点宽度 <strong>{preferenceDraft.nodeWidth}px</strong></span><input type="range" min="220" max="360" step="20" value={preferenceDraft.nodeWidth} onChange={(event) => setPreferenceDraft({ ...preferenceDraft, nodeWidth: Number(event.target.value) })} /></label>
-                        <label className="range-setting"><span>{preferenceDraft.autoFit ? "自动适配缩放上限" : "打开时缩放"} <strong>{Math.round(preferenceDraft.initialZoom * 100)}%</strong></span><input type="range" min="0.5" max="1.5" step="0.1" value={preferenceDraft.initialZoom} onChange={(event) => setPreferenceDraft({ ...preferenceDraft, initialZoom: Number(event.target.value) })} /></label>
-                        <label className="switch-setting"><span><strong>打开时自动适配</strong><small>让全部节点进入可视区域</small></span><input type="checkbox" checked={preferenceDraft.autoFit} onChange={(event) => setPreferenceDraft({ ...preferenceDraft, autoFit: event.target.checked })} /></label>
+                        <label className="range-setting"><span>节点宽度 <strong>{preferenceDraft.nodeWidth}px</strong></span><input type="range" min="220" max="360" step="20" value={preferenceDraft.nodeWidth} onChange={(event) => updatePreferences({ ...preferenceDraft, nodeWidth: Number(event.target.value) })} /></label>
+                        <label className="range-setting"><span>{preferenceDraft.autoFit ? "自动适配缩放上限" : "打开时缩放"} <strong>{Math.round(preferenceDraft.initialZoom * 100)}%</strong></span><input type="range" min="0.5" max="1.5" step="0.1" value={preferenceDraft.initialZoom} onChange={(event) => updatePreferences({ ...preferenceDraft, initialZoom: Number(event.target.value) })} /></label>
+                        <label className="switch-setting"><span><strong>打开时自动适配</strong><small>让全部节点进入可视区域</small></span><input type="checkbox" checked={preferenceDraft.autoFit} onChange={(event) => updatePreferences({ ...preferenceDraft, autoFit: event.target.checked })} /></label>
                       </div>
                     </section>
                     <section className="settings-section">
                       <div className="settings-section-heading"><h3>节点内容</h3><p>调整画布卡片中展示的信息密度。</p></div>
-                      <label className="switch-setting"><span><strong>显示提示词摘要</strong><small>关闭后节点只保留名称与模型</small></span><input type="checkbox" checked={preferenceDraft.showPrompt} onChange={(event) => setPreferenceDraft({ ...preferenceDraft, showPrompt: event.target.checked })} /></label>
+                      <label className="switch-setting"><span><strong>显示提示词摘要</strong><small>关闭后节点只保留名称与模型</small></span><input type="checkbox" checked={preferenceDraft.showPrompt} onChange={(event) => updatePreferences({ ...preferenceDraft, showPrompt: event.target.checked })} /></label>
                     </section>
                   </>
+                )}
+                {tab === "carousel" && (
+                  <section className="settings-section">
+                    <div className="settings-section-heading"><h3>当前主题节点轮播</h3><p>仅当节点包含多张成图时启用；单张成图静态显示，参考图不加入轮播。</p></div>
+                    <CarouselSettingsFields preferences={preferenceDraft.carousel} onChange={(carousel) => updatePreferences({ ...preferenceDraft, carousel })} />
+                  </section>
                 )}
                 {tab === "shortcuts" && shortcutGroups.map((group) => (
                   <section className="settings-section" key={group.title}>
@@ -1469,7 +1784,6 @@ function SettingsDialog({
                   </section>
                 ))}
               </div>
-              <footer className="settings-footer">{error && <p className="settings-error">{error}</p>}<Button variant="ghost" onClick={onClose}>取消</Button><Button disabled={saving || !themeDraft.title.trim()} onClick={save}>保存设置</Button></footer>
             </div>
           </div>
         </Dialog.Content>
@@ -1478,7 +1792,7 @@ function SettingsDialog({
   );
 }
 
-function Workspace({ slug, onBack, onUnauthorized, onDirtyChange }: { slug: string; onBack: () => void; onUnauthorized: () => void; onDirtyChange: (dirty: boolean) => void }) {
+function Workspace({ slug, onBack, onUnauthorized, onDirtyChange, themeMode, onThemeModeChange }: { slug: string; onBack: () => void; onUnauthorized: () => void; onDirtyChange: (dirty: boolean) => void; themeMode: ThemeMode; onThemeModeChange: (mode: ThemeMode) => void }) {
   const queryClient = useQueryClient();
   const themeQuery = useQuery({ queryKey: ["theme", slug], queryFn: () => api.theme(slug) });
   const theme = themeQuery.data;
@@ -1504,7 +1818,6 @@ function Workspace({ slug, onBack, onUnauthorized, onDirtyChange }: { slug: stri
   const [contextVersion, setContextVersion] = useState<ContextTarget>(null);
   const [comparison, setComparison] = useState<Comparison | null>(null);
   const [notice, setNotice] = useState("");
-  const [copied, setCopied] = useState<VersionDetail | null>(null);
   useEffect(() => {
     if (themeQuery.error instanceof ApiError && themeQuery.error.status === 401) onUnauthorized();
   }, [themeQuery.error, onUnauthorized]);
@@ -1520,30 +1833,24 @@ function Workspace({ slug, onBack, onUnauthorized, onDirtyChange }: { slug: stri
     queryClient.setQueryData(["theme", slug], updated);
     queryClient.invalidateQueries({ queryKey: ["themes"] });
   };
-  const mark = async (version: number, marks: Record<string, boolean>) => applyTheme(await api.markVersion(slug, version, marks));
+  const mark = async (version: number, marks: Record<string, boolean>) => applyTheme(await api.markRevision(slug, version, marks));
   const compareSelected = async (versions = selected) => {
     if (versions.length !== 2) { setNotice("请选择两个节点进行比较"); return; }
     setComparison(await api.compare(slug, versions[0], versions[1]));
   };
-  const copyNode = async (version: number) => {
-    const detail = await api.version(slug, version);
-    setCopied(detail);
-    await navigator.clipboard?.writeText(detail.prompt).catch(() => undefined);
-    setNotice("节点内容已复制");
-  };
   const deleteNode = async (version: number) => {
-    if (!confirm(`永久删除节点 #${String(version).padStart(4, "0")}？`)) return;
-    try { applyTheme(await api.deleteVersion(slug, version)); setSelected(selected.filter((item) => item !== version)); }
+    if (!confirm(`永久删除节点 R${String(version).padStart(4, "0")}？`)) return;
+    try { applyTheme(await api.deleteRevision(slug, version)); setSelected(selected.filter((item) => item !== version)); }
     catch (error) { setNotice(error instanceof Error ? error.message : "删除失败"); }
   };
   const discardWorking = async () => {
     if (editorSavingRef.current) { setNotice("节点正在保存，请稍候"); return; }
     if (workingMutationRef.current) return;
-    if (!theme?.dirty || !confirm("丢弃当前未保存节点并恢复到最近版本？")) return;
+    if (!theme?.hasUnsavedChanges || !confirm("丢弃当前未保存节点并恢复到最近节点？")) return;
     workingMutationRef.current = true;
     setWorkingMutation(true);
     try {
-      applyTheme(await api.discardWorking(slug));
+      applyTheme(await api.discardDraft(slug));
       setSelected([]);
       closeEditor(true);
     } catch (error) {
@@ -1553,8 +1860,14 @@ function Workspace({ slug, onBack, onUnauthorized, onDirtyChange }: { slug: stri
       setWorkingMutation(false);
     }
   };
-  const share = async (version: number) => downloadShareCard(theme!, await api.version(slug, version));
-  const contextSummary = typeof contextVersion === "number" ? theme?.versions.find((item) => item.version === contextVersion) : undefined;
+  const share = async (version: number) => {
+    try {
+      await downloadShareCard(theme!, await api.revision(slug, version));
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "分享卡片生成失败");
+    }
+  };
+  const contextSummary = typeof contextVersion === "number" ? theme?.revisions.find((item) => item.id === contextVersion) : undefined;
   const openEditor = (version: number | null, intent?: EditorIntent, parents = selected) => {
     const activeEditor = editorRef.current;
     if (activeEditor.open && editorDirtyRef.current && !confirm("当前编辑内容尚未保存，是否放弃修改？")) return;
@@ -1582,14 +1895,15 @@ function Workspace({ slug, onBack, onUnauthorized, onDirtyChange }: { slug: stri
       <ContextMenu.Trigger asChild>
         <main className={`workspace-shell ${editor.open ? "editor-open" : ""}`}>
           <header className="workspace-header">
-            <div className="workspace-title"><IconButton label="返回主题库" onClick={onBack}><ArrowLeft size={18} /></IconButton><div><h1>{theme.title}</h1><span>{theme.version_count} 节点{theme.dirty ? " · 有未保存修改" : ""}</span></div></div>
+            <div className="workspace-title"><IconButton label="返回主题库" onClick={onBack}><ArrowLeft size={18} /></IconButton><div><h1>{theme.title}</h1><span>{theme.revisionCount} 节点{theme.hasUnsavedChanges ? " · 有未保存修改" : ""}</span></div></div>
             <div className="workspace-actions">
-              <IconButton label={theme.starred ? "取消主题收藏" : "收藏主题"} onClick={async () => applyTheme(await api.toggleThemeStar(slug))}><Star size={18} fill={theme.starred ? "currentColor" : "none"} /></IconButton>
-              <IconButton label={theme.archived ? "恢复主题" : "归档主题"} onClick={async () => applyTheme(await api.toggleArchive(slug))}><Archive size={18} /></IconButton>
+              <IconButton className="workspace-secondary-action" label={theme.starred ? "取消主题收藏" : "收藏主题"} onClick={async () => applyTheme(await api.updateDraft(slug, { starred: !theme.starred }))}><Star size={18} fill={theme.starred ? "currentColor" : "none"} /></IconButton>
+              <IconButton className="workspace-secondary-action" label={theme.archived ? "恢复主题" : "归档主题"} onClick={async () => applyTheme(await api.updateDraft(slug, { archived: !theme.archived }))}><Archive size={18} /></IconButton>
+              <ThemeModeButton mode={themeMode} onChange={onThemeModeChange} />
               <IconButton label="设置" onClick={() => setSettingsOpen(true)}><Settings size={18} /></IconButton>
             </div>
           </header>
-          <VersionCanvas theme={theme} selected={selected} mode={mobile ? "pan" : mode} preferences={preferences} zoom={zoom} recenterSignal={recenterSignal} centerVersion={editor.open ? editor.version : undefined} onSelected={setSelected} onOpen={(version) => openEditor(version, undefined, version == null ? [] : [version])} onBlank={() => closeEditor()} onContext={setContextVersion} onZoomChange={setZoom} />
+          <VersionCanvas key={theme.slug} theme={theme} selected={selected} mode={mobile ? "pan" : mode} preferences={preferences} zoom={zoom} recenterSignal={recenterSignal} centerVersion={editor.open ? editor.version : undefined} onSelected={setSelected} onOpen={(version) => openEditor(version, undefined, version == null ? [] : [version])} onBlank={() => closeEditor()} onContext={setContextVersion} onZoomChange={setZoom} />
           <div className="canvas-toolbar">
             <div className="tool-segment"><IconButton label="平移画布" aria-pressed={mode === "pan"} onClick={() => setMode("pan")}><Hand size={17} /></IconButton><IconButton label="框选节点" aria-pressed={mode === "select"} onClick={() => setMode("select")}><MousePointer2 size={17} /></IconButton></div>
             {selected.length > 0 && <span className="selection-count">{selected.length} 已选</span>}
@@ -1599,22 +1913,20 @@ function Workspace({ slug, onBack, onUnauthorized, onDirtyChange }: { slug: stri
           </div>
           {notice && <div className="toast">{notice}</div>}
           <EditorDialog theme={theme} open={editor.open} version={editor.version} initialParents={editor.parents} initialIntent={editor.intent} sessionId={editor.session} onClose={closeEditor} onSaved={applyTheme} onDirtyChange={setEditorDirty} onSavingChange={(value) => { editorSavingRef.current = value; setEditorSaving(value); }} saveBlocked={workingMutation} canStartSave={() => !workingMutationRef.current} />
-          <SettingsDialog theme={theme} preferences={preferences} open={settingsOpen} onClose={() => setSettingsOpen(false)} onSave={async (themeChanges, nextPreferences) => { const updated = await api.updateTheme(slug, themeChanges); saveWorkspacePreferences(slug, nextPreferences); setPreferences(nextPreferences); setZoom(nextPreferences.initialZoom); applyTheme(updated); }} />
+          <SettingsDialog theme={theme} preferences={preferences} open={settingsOpen} onClose={() => setSettingsOpen(false)} onThemeChange={async (themeChanges) => applyTheme(await api.updateDraft(slug, themeChanges))} onPreferencesChange={(nextPreferences) => { saveWorkspacePreferences(slug, nextPreferences); setPreferences(nextPreferences); }} />
           <Comparator comparison={comparison} open={!!comparison} onClose={() => setComparison(null)} />
         </main>
       </ContextMenu.Trigger>
       <ContextMenu.Portal>
         <ContextMenu.Content className="context-menu">
-          <ContextMenu.Item disabled={contextVersion == null} onSelect={() => contextVersion === "working" ? openEditor(null, undefined, []) : contextVersion != null && openEditor(contextVersion, undefined, [contextVersion])}>编辑<span>Enter</span></ContextMenu.Item>
-          <ContextMenu.Item disabled={typeof contextVersion !== "number"} onSelect={() => typeof contextVersion === "number" && copyNode(contextVersion)}>复制<span>Ctrl+C</span></ContextMenu.Item>
-          <ContextMenu.Item disabled={typeof contextVersion !== "number" || !copied} onSelect={() => { if (typeof contextVersion === "number" && copied) { setSelected([contextVersion]); openEditor(copied.version, "grow", [contextVersion]); } }}>粘贴为子节点<span>Ctrl+V</span></ContextMenu.Item>
-          <ContextMenu.Item className="danger" disabled={contextVersion == null || (contextVersion === "working" && (!theme.dirty || editorSaving || workingMutation))} onSelect={() => contextVersion === "working" ? void discardWorking() : typeof contextVersion === "number" && void deleteNode(contextVersion)}><Trash2 size={14} />{contextVersion === "working" ? "丢弃未保存节点" : "删除"}<span>Del</span></ContextMenu.Item>
+          <ContextMenu.Item disabled={contextVersion == null} onSelect={() => contextVersion === "working" ? openEditor(null, undefined, []) : contextVersion != null && openEditor(contextVersion, undefined, [contextVersion])}>编辑</ContextMenu.Item>
           <ContextMenu.Separator />
-          <ContextMenu.Item disabled={typeof contextVersion !== "number"} onSelect={() => typeof contextVersion === "number" && compareSelected(selected.includes(contextVersion) ? selected : [...selected.slice(-1), contextVersion])}><GitCompareArrows size={14} />比较<span>C</span></ContextMenu.Item>
-          <ContextMenu.Item disabled={typeof contextVersion !== "number"} onSelect={() => typeof contextVersion === "number" && mark(contextVersion, { favorite: !contextSummary?.favorite })}><Star size={14} />{contextSummary?.favorite ? "取消收藏" : "收藏"}<span>S</span></ContextMenu.Item>
-          <ContextMenu.Item disabled={typeof contextVersion !== "number"} onSelect={() => typeof contextVersion === "number" && mark(contextVersion, { featured: !contextSummary?.featured })}><Focus size={14} />{contextSummary?.featured ? "取消代表作" : "标记代表作"}<span>F</span></ContextMenu.Item>
+          <ContextMenu.Item disabled={typeof contextVersion !== "number"} onSelect={() => typeof contextVersion === "number" && mark(contextVersion, { featured: !contextSummary?.featured })}><Focus size={14} />{contextSummary?.featured ? "取消代表作" : "标记代表作"}</ContextMenu.Item>
           <ContextMenu.Separator />
-          <ContextMenu.Item disabled={typeof contextVersion !== "number"} onSelect={() => typeof contextVersion === "number" && share(contextVersion)}><Share2 size={14} />创建分享卡片<span>E</span></ContextMenu.Item>
+          <ContextMenu.Item disabled={typeof contextVersion !== "number"} onSelect={() => typeof contextVersion === "number" && compareSelected(selected.includes(contextVersion) ? selected : [...selected.slice(-1), contextVersion])}><GitCompareArrows size={14} />比较</ContextMenu.Item>
+          <ContextMenu.Item disabled={!contextSummary?.previewUrls.length} onSelect={() => typeof contextVersion === "number" && void share(contextVersion)}><Share2 size={14} />创建分享卡片</ContextMenu.Item>
+          <ContextMenu.Separator />
+          <ContextMenu.Item className="danger" disabled={contextVersion == null || (contextVersion === "working" && (!theme.hasUnsavedChanges || editorSaving || workingMutation))} onSelect={() => contextVersion === "working" ? void discardWorking() : typeof contextVersion === "number" && void deleteNode(contextVersion)}>删除</ContextMenu.Item>
         </ContextMenu.Content>
       </ContextMenu.Portal>
     </ContextMenu.Root>
@@ -1622,7 +1934,23 @@ function Workspace({ slug, onBack, onUnauthorized, onDirtyChange }: { slug: stri
 }
 
 function TokenDialog({ open, onConnected }: { open: boolean; onConnected: () => void }) {
-  const [token, setToken] = useState(getStoredToken());
+  const [token, setToken] = useState("");
+  const [error, setError] = useState("");
+  const [connecting, setConnecting] = useState(false);
+  const connect = async () => {
+    if (!token || connecting) return;
+    setConnecting(true);
+    setError("");
+    try {
+      await connectBrowser(token);
+      setToken("");
+      onConnected();
+    } catch (connectError) {
+      setError(connectError instanceof Error ? connectError.message : "连接失败");
+    } finally {
+      setConnecting(false);
+    }
+  };
   return (
     <Dialog.Root open={open}>
       <Dialog.Portal>
@@ -1631,8 +1959,9 @@ function TokenDialog({ open, onConnected }: { open: boolean; onConnected: () => 
           <KeyRound size={22} />
           <Dialog.Title>连接 Prompt Vault</Dialog.Title>
           <Dialog.Description className="sr-only">输入服务端配置的访问令牌。</Dialog.Description>
-          <label>访问令牌<Input type="password" autoFocus value={token} onChange={(event) => setToken(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && token) { setStoredToken(token); onConnected(); } }} /></label>
-          <Button disabled={!token} onClick={() => { setStoredToken(token); onConnected(); }}>连接</Button>
+          <label>访问令牌<Input type="password" autoFocus value={token} onChange={(event) => setToken(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void connect(); }} /></label>
+          {error && <p className="error-text" role="alert">{error}</p>}
+          <Button disabled={!token || connecting} onClick={() => void connect()}>{connecting ? "连接中..." : "连接"}</Button>
         </Dialog.Content>
       </Dialog.Portal>
     </Dialog.Root>
@@ -1646,8 +1975,7 @@ export default function App() {
   const [tokenOpen, setTokenOpen] = useState(false);
   const [workspaceDirty, setWorkspaceDirty] = useState(false);
   useEffect(() => {
-    const token = getStoredToken();
-    if (token) setStoredToken(token);
+    localStorage.removeItem("prompt-vault-token");
   }, []);
   useEffect(() => {
     const onHash = () => {
@@ -1675,8 +2003,7 @@ export default function App() {
   const back = () => { location.hash = "#/"; };
   return (
     <>
-      {slug ? <Workspace slug={slug} onBack={back} onUnauthorized={() => setTokenOpen(true)} onDirtyChange={setWorkspaceDirty} /> : <Library onOpen={openTheme} onUnauthorized={() => setTokenOpen(true)} />}
-      <div className="global-controls"><IconButton label={themeMode === "dark" ? "切换浅色" : "切换深色"} onClick={() => setThemeMode(themeMode === "dark" ? "light" : "dark")}>{themeMode === "dark" ? <Sun size={17} /> : <Moon size={17} />}</IconButton></div>
+      {slug ? <Workspace slug={slug} onBack={back} onUnauthorized={() => setTokenOpen(true)} onDirtyChange={setWorkspaceDirty} themeMode={themeMode} onThemeModeChange={setThemeMode} /> : <Library onOpen={openTheme} onUnauthorized={() => setTokenOpen(true)} themeMode={themeMode} onThemeModeChange={setThemeMode} />}
       <TokenDialog open={tokenOpen} onConnected={() => { setTokenOpen(false); queryClient.invalidateQueries(); }} />
     </>
   );

@@ -3,6 +3,7 @@ import {
   canDragCanvas,
   canDragElement,
   canSaveEditor,
+  editorSaveOperation,
   approachZoom,
   availableViewportCenter,
   initialEditorIntent,
@@ -89,19 +90,24 @@ describe("canvas pointer behavior", () => {
   });
 });
 
-describe("working-root editor state", () => {
-  it("opens the working tree in overwrite mode", () => {
-    expect(initialEditorIntent(null)).toBe("overwrite");
-    expect(initialEditorIntent(3)).toBe("overwrite");
-    expect(initialEditorIntent(null, "grow")).toBe("grow");
+describe("Draft editor state", () => {
+  it("opens content as a Draft update unless saving a Revision was requested", () => {
+    expect(initialEditorIntent(null)).toBe("updateDraft");
+    expect(initialEditorIntent(3)).toBe("updateDraft");
+    expect(initialEditorIntent(null, "saveRevision")).toBe("saveRevision");
   });
 
-  it("allows saving a working root and publishing its first node", () => {
-    expect(canSaveEditor(null, "overwrite", { change_note: "", parents: [] })).toBe(true);
-    expect(canSaveEditor(null, "grow", { change_note: "Root", parents: [] }, true)).toBe(true);
-    expect(canSaveEditor(null, "grow", { change_note: "", parents: [] }, true)).toBe(true);
-    expect(canSaveEditor(null, "grow", { change_note: "Not another root", parents: [] }, false)).toBe(false);
-    expect(canSaveEditor(3, "grow", { change_note: "", parents: [] })).toBe(false);
+  it("allows Draft updates and Revision saves while the domain validates content state", () => {
+    expect(canSaveEditor(null, "updateDraft", { note: "", parentIds: [] })).toBe(true);
+    expect(canSaveEditor(null, "saveRevision", { note: "Root", parentIds: [] }, true)).toBe(true);
+    expect(canSaveEditor(3, "saveRevision", { note: "Child", parentIds: [3] })).toBe(true);
+  });
+
+  it("overwrites the displayed saved node and only creates a child for Save As", () => {
+    expect(editorSaveOperation(3, "updateDraft")).toBe("overwriteRevision");
+    expect(editorSaveOperation(3, "saveRevision")).toBe("saveChild");
+    expect(editorSaveOperation(null, "updateDraft")).toBe("updateDraft");
+    expect(editorSaveOperation(null, "saveRevision")).toBe("saveChild");
   });
 });
 
@@ -114,9 +120,9 @@ describe("node editor toggle", () => {
     expect(nextEditorState(opened, 3, undefined, [3])).toEqual({ open: false, version: null, parents: [], session: 1 });
   });
 
-  it("switches directly to a different node and keeps explicit grow actions open", () => {
+  it("switches directly to a different node and keeps explicit Revision saves open", () => {
     const opened = nextEditorState(closed, 3, undefined, [3]);
     expect(nextEditorState(opened, 4, undefined, [4])).toMatchObject({ open: true, version: 4, parents: [4], session: 2 });
-    expect(nextEditorState(opened, 3, "grow", [3])).toMatchObject({ open: true, version: 3, intent: "grow", session: 2 });
+    expect(nextEditorState(opened, 3, "saveRevision", [3])).toMatchObject({ open: true, version: 3, intent: "saveRevision", session: 2 });
   });
 });

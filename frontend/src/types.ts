@@ -1,6 +1,8 @@
 export type Asset = {
   name: string;
   sha256: string;
+  size: number;
+  mime: string;
   url: string;
 };
 
@@ -9,24 +11,7 @@ export type AssetGroups = {
   result: Asset[];
 };
 
-export type VersionSummary = {
-  version: number;
-  parent: number | null;
-  parents: number[];
-  tags: string[];
-  featured: boolean;
-  favorite: boolean;
-  hidden: boolean;
-  reachable: boolean;
-  created_at: string;
-  actor: string;
-  change_note: string;
-  digest: string;
-  prompt_excerpt: string;
-  preview_url: string | null;
-};
-
-export type VersionDetail = VersionSummary & {
+export type Draft = {
   prompt: string;
   negative: string;
   notes: string;
@@ -35,11 +20,24 @@ export type VersionDetail = VersionSummary & {
   assets: AssetGroups;
 };
 
-export type RepresentativeVersion = {
-  version: number;
-  change_note: string;
-  preview_url: string | null;
+export type RevisionSummary = {
+  id: number;
+  parentIds: number[];
+  note: string;
+  actor: string;
+  createdAt: string;
+  digest: string;
+  promptExcerpt: string;
+  featured: boolean;
+  favorite: boolean;
+  hidden: boolean;
+  previewAsset?: { kind: "reference" | "result"; name: string; sha256: string };
+  previewAssets?: Array<{ kind: "reference" | "result"; name: string; sha256: string }>;
+  previewUrl?: string | null;
+  previewUrls: string[];
 };
+
+export type Revision = RevisionSummary & { draft: Draft };
 
 export type Theme = {
   slug: string;
@@ -49,40 +47,42 @@ export type Theme = {
   tags: string[];
   starred: boolean;
   archived: boolean;
-  prompt: string;
-  negative: string;
-  notes: string;
-  model: string;
-  params: string;
-  assets: AssetGroups;
-  dirty: boolean;
-  working_base: number | null;
-  current_version: number | null;
-  version_count: number;
-  can_create_root: boolean;
-  versions: VersionSummary[];
-  representative_versions: RepresentativeVersion[];
-  has_favorite_versions: boolean;
-  updated_at: string;
+  updatedAt: string;
+  baseRevision: number | null;
+  hasUnsavedChanges: boolean;
+  revisionCount: number;
+  referenceUrls: string[];
+  workingTitle: string;
+  draft: Draft;
+  revisions: RevisionSummary[];
+  representativeRevisions: Array<{ id: number; note: string; previewUrl: string; sha256: string }>;
+  hasFavoriteRevisions: boolean;
 };
 
 export type Comparison = {
-  left: VersionDetail;
-  right: VersionDetail;
+  left: Revision;
+  right: Revision;
   diffs: Record<"prompt" | "negative" | "notes", string>;
-  metadata_changes: Array<{ field: string; left: string; right: string }>;
+  metadataChanges: Array<{ field: string; left: string; right: string }>;
+  assetChanges: Record<"reference" | "result", {
+    removed: Array<{ name: string; sha256: string }>;
+    added: Array<{ name: string; sha256: string }>;
+    orderChanged: boolean;
+    leftOrder: string[];
+    rightOrder: string[];
+  }>;
 };
 
 export type ThemeFilter = "active" | "archived" | "favorite" | "all";
 export type CanvasMode = "pan" | "select";
-export type EditorIntent = "overwrite" | "grow";
+export type EditorIntent = "updateDraft" | "saveRevision";
 
 export type EditorDraft = {
-  change_note: string;
+  note: string;
   prompt: string;
   negative: string;
   notes: string;
   model: string;
   params: string;
-  parents: number[];
+  parentIds: number[];
 };

@@ -1,8 +1,11 @@
+import { defaultCarouselPreferences, normalizeCarouselPreferences, type CarouselPreferences } from "./library-preferences";
+
 export type WorkspacePreferences = {
   autoFit: boolean;
   initialZoom: number;
   nodeWidth: number;
   showPrompt: boolean;
+  carousel: CarouselPreferences;
 };
 
 export const defaultWorkspacePreferences: WorkspacePreferences = {
@@ -10,6 +13,7 @@ export const defaultWorkspacePreferences: WorkspacePreferences = {
   initialZoom: 1,
   nodeWidth: 260,
   showPrompt: true,
+  carousel: defaultCarouselPreferences,
 };
 
 function finiteNumber(value: unknown, fallback: number, minimum: number, maximum: number) {
@@ -25,6 +29,7 @@ export function normalizeWorkspacePreferences(value: unknown): WorkspacePreferen
     initialZoom: finiteNumber(candidate.initialZoom, defaultWorkspacePreferences.initialZoom, 0.5, 1.5),
     nodeWidth: finiteNumber(candidate.nodeWidth, defaultWorkspacePreferences.nodeWidth, 220, 360),
     showPrompt: typeof candidate.showPrompt === "boolean" ? candidate.showPrompt : defaultWorkspacePreferences.showPrompt,
+    carousel: normalizeCarouselPreferences(candidate.carousel),
   };
 }
 

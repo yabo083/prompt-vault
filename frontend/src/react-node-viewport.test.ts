@@ -30,19 +30,19 @@ describe("React node viewport synchronization", () => {
       .toBe("matrix(1, 0, 0, 1, 420, 180)");
   });
 
-  it("draws visible edges inside the same HTML layer as React nodes", () => {
+  it("draws visible edges from current G6 positions instead of stale wrapper transforms", () => {
     const container = document.createElement("div");
     container.innerHTML = '<div class="html-layer"><div class="key" style="width:260px;height:384px;transform:matrix(1, 0, 0, 1, 130, 192)"><div class="version-node" data-version="1"></div></div><div class="key" style="width:260px;height:384px;transform:matrix(1, 0, 0, 1, 130, 652)"><div class="version-node" data-version="4"></div></div></div>';
-    const positions: Record<string, [number, number]> = { "version-1": [130, 83], "version-4": [130, 652] };
+    const positions: Record<string, [number, number]> = { "revision-1": [420, 83], "revision-4": [420, 652] };
 
     expect(syncReactEdges(container, { getElementPosition: (id) => positions[id] }, [
-      { id: "edge-1-4", source: "version-1", target: "version-4", state: "lineage" },
+      { id: "edge-1-4", source: "revision-1", target: "revision-4", state: "lineage" },
     ])).toBe(true);
 
     const svg = container.querySelector(".html-layer > .react-edge-layer");
     const path = svg?.querySelector("path");
     expect(svg).not.toBeNull();
     expect(path?.getAttribute("class")).toBe("react-edge lineage");
-    expect(path?.getAttribute("d")).toBe("M 260 576 C 260 614, 260 614, 260 652");
+    expect(path?.getAttribute("d")).toBe("M 550 467 C 550 559.5, 550 559.5, 550 652");
   });
 });

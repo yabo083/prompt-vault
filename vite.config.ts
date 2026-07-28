@@ -12,9 +12,9 @@ export default defineConfig({
     manifest: true,
     rollupOptions: {
       output: {
-        entryFileNames: "assets/prompt-vault.js",
+        entryFileNames: "assets/prompt-vault-[hash].js",
         chunkFileNames: "assets/[name]-[hash].js",
-        assetFileNames: "assets/[name][extname]",
+        assetFileNames: "assets/[name]-[hash][extname]",
         manualChunks(id) {
           const path = id.replaceAll("\\", "/");
           if (path.includes("/node_modules/monaco-editor/") || path.includes("/node_modules/@monaco-editor/")) return "monaco";
@@ -37,7 +37,7 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      "/api": "http://127.0.0.1:8767",
+      "/api": "http://127.0.0.1:8768",
     },
   },
 });

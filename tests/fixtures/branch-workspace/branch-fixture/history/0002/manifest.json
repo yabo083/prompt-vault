@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "parent": 1,
+  "parents": [1],
+  "branch": "feature",
+  "digest": "81d093ec54aff70da03eecc87981adfe230d245b3f333ec7ead044e87dc62f23",
+  "created_at": "2026-07-27T23:16:01+08:00",
+  "actor": "fixture",
+  "change_note": "Feature",
+  "meta": { "model": "", "params": "" },
+  "assets": { "reference": [], "result": [] },
+  "integrity": "0249b5b93b962915e4f4cbad53ca0c2dc7efd80dc86daae5046098cf3a282fd1"
+}

@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "parent": null,
+  "parents": [],
+  "branch": "main",
+  "digest": "4c78076e29a52f2e875f6194f8d6d99c427c875bd7dffe615f947c8211636b74",
+  "created_at": "2026-07-27T23:00:16+08:00",
+  "actor": "fixture",
+  "change_note": "Initial revision",
+  "meta": { "model": "Krea 2", "params": "steps: 8" },
+  "assets": { "reference": [], "result": [] },
+  "integrity": "e0c16ca5c04a4b599ff614cd43d43ed3361310d0604d6a46c26b2580bcb7d4a2"
+}

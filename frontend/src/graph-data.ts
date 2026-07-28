@@ -1,5 +1,6 @@
 import type { EdgeData, NodeData } from "@antv/g6";
-import type { Theme, VersionSummary } from "./types";
+import { defaultCarouselPreferences, type CarouselPreferences } from "./library-preferences";
+import type { RevisionSummary, Theme } from "./types";
 
 export type VaultNodeData = {
   version: number | null;
@@ -9,6 +10,8 @@ export type VaultNodeData = {
   model: string;
   params: string;
   preview: string | null;
+  previewUrls: string[];
+  carousel: CarouselPreferences;
   featured: boolean;
   favorite: boolean;
   dirty: boolean;
@@ -17,21 +20,33 @@ export type VaultNodeData = {
 };
 
 export type GraphDisplayOptions = {
+  autoFit?: boolean;
+  initialZoom?: number;
   nodeWidth?: number;
   showPrompt?: boolean;
+  carousel?: CarouselPreferences;
 };
 
-export function versionId(version: number) {
-  return `version-${version}`;
+export function revisionId(revision: number) {
+  return `revision-${revision}`;
 }
 
-export function normalizeParents(version: Pick<VersionSummary, "parent" | "parents">) {
-  if (Array.isArray(version.parents)) return version.parents;
-  return version.parent == null ? [] : [version.parent];
+export function normalizeParents(revision: Pick<RevisionSummary, "parentIds">) {
+  return revision.parentIds;
 }
 
-export function ancestorsOf(versions: VersionSummary[], selected: number[]) {
-  const parents = new Map(versions.map((version) => [version.version, normalizeParents(version)]));
+export function graphStructureSignature(theme: Theme, options: GraphDisplayOptions = {}) {
+  return JSON.stringify([
+    theme.revisions.map((revision) => [revision.id, revision.parentIds, revision.hidden]),
+    theme.hasUnsavedChanges,
+    theme.baseRevision,
+    options.nodeWidth,
+    options.showPrompt,
+  ]);
+}
+
+export function ancestorsOf(revisions: RevisionSummary[], selected: number[]) {
+  const parents = new Map(revisions.map((revision) => [revision.id, normalizeParents(revision)]));
   const lineage = new Set<number>();
   const pending = [...selected];
   while (pending.length) {
@@ -46,10 +61,11 @@ export function ancestorsOf(versions: VersionSummary[], selected: number[]) {
 export function toGraphData(theme: Theme, options: GraphDisplayOptions = {}): { nodes: NodeData[]; edges: EdgeData[] } {
   const nodeWidth = options.nodeWidth || 260;
   const showPrompt = options.showPrompt !== false;
+  const carousel = options.carousel || defaultCarouselPreferences;
   const initialNodeHeight = nodeWidth + (showPrompt ? 124 : 70);
-  const allVersions = new Map(theme.versions.map((version) => [version.version, version]));
-  const versions = [...theme.versions].reverse().filter((version) => !version.hidden);
-  const visible = new Set(versions.map((version) => version.version));
+  const allRevisions = new Map(theme.revisions.map((revision) => [revision.id, revision]));
+  const revisions = [...theme.revisions].reverse().filter((revision) => !revision.hidden);
+  const visible = new Set(revisions.map((revision) => revision.id));
   const resolveVisibleParents = (parents: number[]) => {
     const resolved = new Set<number>();
     const pending = [...parents];
@@ -60,28 +76,30 @@ export function toGraphData(theme: Theme, options: GraphDisplayOptions = {}): { 
       visited.add(parent);
       if (visible.has(parent)) resolved.add(parent);
       else {
-        const hiddenParent = allVersions.get(parent);
+        const hiddenParent = allRevisions.get(parent);
         if (hiddenParent) pending.push(...normalizeParents(hiddenParent));
       }
     }
     return [...resolved];
   };
   const resolvedParents = new Map(
-    versions.map((version) => [version.version, resolveVisibleParents(normalizeParents(version))]),
+    revisions.map((revision) => [revision.id, resolveVisibleParents(normalizeParents(revision))]),
   );
-  const parentCounts = new Map(versions.map((version) => [version.version, resolvedParents.get(version.version)!.length]));
-  const nodes: NodeData[] = versions.map((version) => ({
-    id: versionId(version.version),
+  const parentCounts = new Map(revisions.map((revision) => [revision.id, resolvedParents.get(revision.id)!.length]));
+  const nodes: NodeData[] = revisions.map((revision) => ({
+    id: revisionId(revision.id),
     data: {
-      version: version.version,
+      version: revision.id,
       working: false,
-      title: version.change_note || version.digest.slice(0, 6),
-      prompt: version.prompt_excerpt,
+      title: revision.note || revision.digest.slice(0, 6),
+      prompt: revision.promptExcerpt,
       model: "",
       params: "",
-      preview: version.preview_url,
-      featured: version.featured,
-      favorite: version.favorite,
+      preview: revision.previewUrl || null,
+      previewUrls: revision.previewUrls,
+      carousel,
+      featured: revision.featured,
+      favorite: revision.favorite,
       dirty: false,
       width: nodeWidth,
       showPrompt,
@@ -90,10 +108,10 @@ export function toGraphData(theme: Theme, options: GraphDisplayOptions = {}): { 
       size: [nodeWidth, initialNodeHeight],
       ports: [
         { key: "out", placement: "bottom", r: 0 },
-        ...Array.from({ length: Math.max(1, parentCounts.get(version.version) || 0) }, (_, index) => ({
+        ...Array.from({ length: Math.max(1, parentCounts.get(revision.id) || 0) }, (_, index) => ({
           key: `in-${index}`,
           placement: [
-            (index + 1) / (Math.max(1, parentCounts.get(version.version) || 0) + 1),
+            (index + 1) / (Math.max(1, parentCounts.get(revision.id) || 0) + 1),
             0,
           ] as [number, number],
           r: 0,
@@ -102,31 +120,33 @@ export function toGraphData(theme: Theme, options: GraphDisplayOptions = {}): { 
     },
   }));
 
-  const edges: EdgeData[] = versions.flatMap((version) =>
-    resolvedParents.get(version.version)!.map((parent, index) => ({
-      id: `edge-${parent}-${version.version}-${index}`,
-      source: versionId(parent),
-      target: versionId(version.version),
-      data: { sourceVersion: parent, targetVersion: version.version },
+  const edges: EdgeData[] = revisions.flatMap((revision) =>
+    resolvedParents.get(revision.id)!.map((parent, index) => ({
+      id: `edge-${parent}-${revision.id}-${index}`,
+      source: revisionId(parent),
+      target: revisionId(revision.id),
+      data: { sourceVersion: parent, targetVersion: revision.id },
       style: { sourcePort: "out", targetPort: `in-${index}` },
     })),
   );
 
-  if (theme.dirty || versions.length === 0) {
-    const workingParents = theme.working_base == null ? [] : resolveVisibleParents([theme.working_base]);
+  if (theme.hasUnsavedChanges || revisions.length === 0) {
+    const workingParents = theme.baseRevision == null ? [] : resolveVisibleParents([theme.baseRevision]);
     nodes.push({
       id: "working",
       data: {
         version: null,
         working: true,
-        title: versions.length ? "未保存节点" : "新节点",
-        prompt: theme.prompt,
-        model: theme.model,
-        params: theme.params,
-        preview: theme.assets.result[0]?.url || theme.assets.reference[0]?.url || null,
+        title: theme.workingTitle || (revisions.length ? "未保存 Draft" : "新 Draft"),
+        prompt: theme.draft.prompt,
+        model: theme.draft.model,
+        params: theme.draft.params,
+        preview: theme.draft.assets.result[0]?.url || theme.draft.assets.reference[0]?.url || null,
+        previewUrls: theme.draft.assets.result.map((asset) => asset.url),
+        carousel,
         featured: false,
         favorite: false,
-        dirty: theme.dirty,
+        dirty: theme.hasUnsavedChanges,
         width: nodeWidth,
         showPrompt,
       } satisfies VaultNodeData,
@@ -145,7 +165,7 @@ export function toGraphData(theme: Theme, options: GraphDisplayOptions = {}): { 
     workingParents.forEach((parent, index) => {
       edges.push({
         id: `edge-${parent}-working-${index}`,
-        source: versionId(parent),
+        source: revisionId(parent),
         target: "working",
         data: { sourceVersion: parent, targetVersion: null },
         style: { sourcePort: "out", targetPort: `in-${index}`, lineDash: [5, 5] },

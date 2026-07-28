@@ -31,7 +31,7 @@ export function syncReactNodeViewport(container: HTMLElement, graph: ViewportGra
 export function syncReactNodePositions(container: HTMLElement, graph: PositionedGraph) {
   container.querySelectorAll<HTMLElement>(".version-node").forEach((node) => {
     const version = node.dataset.version;
-    const id = version === "working" ? "working" : version ? `version-${version}` : "";
+    const id = version === "working" ? "working" : version ? `revision-${version}` : "";
     const wrapper = node.parentElement;
     if (!id || !wrapper) return;
     const position = graph.getElementPosition(id);
@@ -52,13 +52,10 @@ export function syncReactEdges(container: HTMLElement, graph: PositionedGraph, e
   const nodes = new Map<string, { x: number; y: number; width: number; height: number }>();
   container.querySelectorAll<HTMLElement>(".version-node").forEach((node) => {
     const version = node.dataset.version;
-    const id = version === "working" ? "working" : version ? `version-${version}` : "";
+    const id = version === "working" ? "working" : version ? `revision-${version}` : "";
     const wrapper = node.parentElement;
     if (!id || !wrapper) return;
-    const matrix = wrapper.style.transform.match(/^matrix\(([^)]+)\)$/)?.[1].split(",").map(Number);
-    const position = matrix?.length === 6 && matrix.every(Number.isFinite)
-      ? [matrix[4], matrix[5]]
-      : graph.getElementPosition(id);
+    const position = graph.getElementPosition(id);
     const width = node.offsetWidth || Number.parseFloat(wrapper.style.width);
     const height = node.offsetHeight || Number.parseFloat(wrapper.style.height);
     nodes.set(id, { x: position[0], y: position[1], width, height });

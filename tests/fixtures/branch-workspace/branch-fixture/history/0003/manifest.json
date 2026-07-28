@@ -1,0 +1,13 @@
+{
+  "version": 3,
+  "parent": 1,
+  "parents": [1],
+  "branch": "main",
+  "digest": "855893cf08e3985e96d6ca1ba585c98962f23fb3b344ef2bd14e15cdf5e1c2c6",
+  "created_at": "2026-07-27T23:16:01+08:00",
+  "actor": "fixture",
+  "change_note": "Main",
+  "meta": { "model": "", "params": "" },
+  "assets": { "reference": [], "result": [] },
+  "integrity": "41f55b458a90eaa86ae930f54947dd97fdc0842beea5263518893d31719da3e4"
+}
