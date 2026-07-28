@@ -16,43 +16,46 @@ It combines a React/G6 browser workspace, a Hono API on Node.js, an authenticate
 - Operate one or more Vault Hosts through a revocable, browser-authorized CLI.
 - Give Agent Skills-compatible clients a guarded CLI interaction workflow.
 
-## Quick Start With Docker
+## Quick Start
 
-Requirements: Docker Engine with Docker Compose.
+Requirements: Node.js 20.20 or newer.
 
 ```bash
-mkdir prompt-vault && cd prompt-vault
+npm install --global @miyako-lab/prompt-vault-cli
+prompt-vault serve
+```
+
+The first run initializes `~/PromptVault`, starts the complete Node Host in the current terminal, authorizes the local CLI, and opens the Web UI. Press `Ctrl+C` to stop it. Use an explicit data directory when needed:
+
+```bash
+prompt-vault init --directory /path/to/PromptVault
+prompt-vault serve --directory /path/to/PromptVault
+```
+
+The npm package contains the CLI, Node Host, and compiled React UI. Vite and Docker are not required for local use.
+
+For an independently deployed Host, connect the same CLI over HTTPS:
+
+```bash
+prompt-vault connect https://vault.example.com --name production
+```
+
+The connecting CLI does not manage the External Host lifecycle. Docker, systemd, npm, or the server administrator owns deployment and updates.
+
+### Docker
+
+Docker remains available for an External Host:
+
+```bash
 curl -LO https://raw.githubusercontent.com/yabo083/prompt-vault/main/compose.yaml
 docker compose up -d
 ```
-
-Prompt Vault generates a strong Host Token on first start. Retrieve it from the persistent data volume:
-
-```bash
-docker compose exec prompt-vault cat /data/.vault-token
-```
-
-Open <http://localhost:8767>, enter the Host Token, and the browser will exchange it for an HTTP-only session cookie.
-
-On Windows PowerShell, download the Compose file with:
-
-```powershell
-New-Item -ItemType Directory prompt-vault
-Set-Location prompt-vault
-Invoke-WebRequest https://raw.githubusercontent.com/yabo083/prompt-vault/main/compose.yaml -OutFile compose.yaml
-docker compose up -d
-docker compose exec prompt-vault cat /data/.vault-token
-```
-
-The named Docker volume contains the workspace, Host Token, and CLI authorization records. Recreating or updating the container does not replace this data.
-
-The default Compose binding accepts connections only from the Docker host. For deliberate LAN exposure, set `PROMPT_VAULT_BIND=0.0.0.0` and protect the connection with a trusted network or HTTPS reverse proxy.
 
 See [Deployment](docs/deployment.md) for upgrades, backups, HTTPS reverse proxies, token rotation, source builds, and systemd installation.
 
 ## CLI
 
-Install the standalone client with Node.js 20.20 or newer:
+The same installation runs a local Host and connects to External Hosts:
 
 ```bash
 npm install --global @miyako-lab/prompt-vault-cli
@@ -66,7 +69,7 @@ prompt-vault
 prompt-vault theme list
 ```
 
-The CLI opens a browser approval page. It never stores the Host Token. Approval creates a separate bearer credential that can be replaced by reauthorizing or revoked with `prompt-vault auth logout`.
+External authorization opens a browser approval page. The browser sees only a short user code; the secret device code stays with the CLI. Approval creates a separate revocable credential. Remote plaintext HTTP is refused unless `--allow-insecure-http` is explicitly passed for a trusted development network.
 
 The current Vault Host is used automatically. Agent and pipeline stdout receives the stable `{ ok, data }` or `{ ok, error }` envelope automatically; `--json` only forces that format in an interactive terminal. See the [CLI guide](docs/cli.md) for all commands and the two-step agent authorization flow.
 
@@ -97,7 +100,7 @@ Existing legacy workspaces are projected through compatibility reads and are not
 
 The workspace contains ordinary directories, Markdown files, and JSON metadata. Revision assets are copied into a content-addressed `.assets/` store and verified by SHA-256. Multi-file mutations use locks, staging, and atomic replacement.
 
-The Host Token grants administrator browser access. Keep it private and use HTTPS whenever traffic leaves a trusted network. CLI credentials are independently revocable and should not be copied between users.
+The Host Token is an administrator recovery credential that can create an independent browser session. Keep it private and use HTTPS whenever traffic leaves a trusted network. Browser sessions and CLI credentials are independently revocable and should not be copied between users.
 
 Back up the data volume independently from application releases. Application rollback and workspace rollback are separate operations.
 

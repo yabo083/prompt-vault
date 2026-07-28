@@ -42,3 +42,10 @@ _Avoid_: Remote, origin
 **CLI Authorization**:
 A user-approved credential that grants the CLI access to one Vault Host and can be revoked independently.
 _Avoid_: Login session, password
+
+**Managed Local Host**:
+A Vault Host on the same computer whose runtime lifecycle is owned by the CLI. It uses the same HTTP contract as every other Vault Host.
+
+**External Host**:
+A Vault Host whose deployment lifecycle is managed independently from the connecting CLI.
+_Avoid_: Remote instance

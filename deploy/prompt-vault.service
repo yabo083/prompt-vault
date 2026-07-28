@@ -12,6 +12,7 @@ Environment=HOST=127.0.0.1
 Environment=PROMPT_VAULT_WORKSPACE=/var/lib/prompt-vault/workspace
 Environment=PROMPT_VAULT_TOKEN_FILE=/var/lib/prompt-vault/.vault-token
 Environment=PROMPT_VAULT_CREDENTIAL_DIRECTORY=/var/lib/prompt-vault/.vault-auth
+Environment=PROMPT_VAULT_BROWSER_SESSION_DIRECTORY=/var/lib/prompt-vault/.browser-sessions
 Environment=PROMPT_VAULT_STATIC_DIRECTORY=/opt/prompt-vault/current/static/dist
 EnvironmentFile=-/etc/prompt-vault/prompt-vault.env
 ExecStart=/usr/bin/node /opt/prompt-vault/current/dist/server/index.js

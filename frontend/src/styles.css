@@ -211,6 +211,13 @@ label { display: grid; gap: 6px; color: var(--text); font-size: 12px; font-weigh
 .zoom-readout:hover { color: var(--ink); background: var(--surface); }
 .toast { position: absolute; z-index: 50; left: 50%; top: 82px; padding: 8px 11px; border: 1px solid var(--line); border-radius: 4px; background: var(--raised); box-shadow: var(--lift-shadow); font-size: 12px; transform: translateX(-50%); }
 .loading-screen { display: grid; width: 100vw; height: 100vh; place-items: center; color: var(--quiet); font: 12px var(--mono); }
+.launch-screen { display: grid; width: 100%; min-height: 100vh; place-items: center; padding: 24px; background: var(--page); }
+.launch-card { display: grid; width: min(480px, 100%); gap: 20px; padding: 26px; border: 1px solid var(--line); border-radius: 8px; background: var(--raised); box-shadow: var(--lift-shadow); }
+.launch-mark { display: grid; width: 42px; height: 42px; place-items: center; border: 1px solid var(--line); border-radius: 8px; color: var(--text); background: var(--page); }
+.launch-mark.complete { color: var(--accent); }
+.launch-heading { display: grid; gap: 6px; }
+.launch-heading h1 { margin: 0; font-size: 18px; font-weight: 650; letter-spacing: 0; }
+.launch-heading p { margin: 0; color: var(--quiet); font-size: 12px; line-height: 1.55; }
 
 .dialog-overlay { position: fixed; z-index: 60; inset: 0; background: var(--overlay); animation: fade-in 150ms ease-out; }
 .dialog-content {
@@ -362,6 +369,11 @@ label { display: grid; gap: 6px; color: var(--text); font-size: 12px; font-weigh
 
 @media (max-width: 1080px) {
   .theme-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
+@media (max-width: 760px) {
+  .launch-screen { align-items: start; padding: 10vh 12px 24px; }
+  .launch-card { padding: 20px 16px; }
 }
 @media (max-width: 760px) {
   .library-shell { padding: 0 16px 48px; }

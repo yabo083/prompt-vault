@@ -63,6 +63,7 @@ import { buildCarouselSlides, carouselAutoplayOptions, loadLibraryPreferences, s
 import { syncReactEdges, syncReactNodePositions, syncReactNodeViewport, type ReactOverlayEdge } from "./react-node-viewport";
 import { nextThemeMode, normalizeThemeMode, resolveThemeMode, type ThemeMode } from "./theme-mode";
 import { loadWorkspacePreferences, saveWorkspacePreferences, type WorkspacePreferences } from "./workspace-preferences";
+import { consumeLaunchNonce, LocalLaunchScreen } from "./LocalLaunchScreen";
 import type {
   Asset,
   CanvasMode,
@@ -1972,11 +1973,9 @@ export default function App() {
   const queryClient = useQueryClient();
   const [themeMode, setThemeMode] = useThemeMode();
   const [slug, setSlug] = useState(() => location.hash.startsWith("#/theme/") ? decodeURIComponent(location.hash.slice(8)) : "");
+  const [launchNonce, setLaunchNonce] = useState(consumeLaunchNonce);
   const [tokenOpen, setTokenOpen] = useState(false);
   const [workspaceDirty, setWorkspaceDirty] = useState(false);
-  useEffect(() => {
-    localStorage.removeItem("prompt-vault-token");
-  }, []);
   useEffect(() => {
     const onHash = () => {
       const nextSlug = location.hash.startsWith("#/theme/") ? decodeURIComponent(location.hash.slice(8)) : "";
@@ -2001,6 +2000,7 @@ export default function App() {
   }, [workspaceDirty]);
   const openTheme = (next: string) => { location.hash = `#/theme/${encodeURIComponent(next)}`; };
   const back = () => { location.hash = "#/"; };
+  if (launchNonce) return <LocalLaunchScreen nonce={launchNonce} onContinue={() => setLaunchNonce("")} />;
   return (
     <>
       {slug ? <Workspace slug={slug} onBack={back} onUnauthorized={() => setTokenOpen(true)} onDirtyChange={setWorkspaceDirty} themeMode={themeMode} onThemeModeChange={setThemeMode} /> : <Library onOpen={openTheme} onUnauthorized={() => setTokenOpen(true)} themeMode={themeMode} onThemeModeChange={setThemeMode} />}

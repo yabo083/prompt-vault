@@ -32,6 +32,13 @@ export async function connectBrowser(token: string) {
   });
 }
 
+export async function claimLocalLaunch(nonce: string) {
+  return request<void>("/api/v2/auth/launch", {
+    method: "POST",
+    body: JSON.stringify({ nonce }),
+  });
+}
+
 export function revisionAssetUrl(slug: string, revisionId: number, digest: string, kind: "reference" | "result", name: string) {
   return `/api/v2/themes/${encodeURIComponent(slug)}/revisions/${revisionId}/assets/${kind}/${encodeURIComponent(name)}?v=${encodeURIComponent(digest)}`;
 }

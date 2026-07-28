@@ -93,7 +93,7 @@
     ]
   },
   "index.html": {
-    "file": "assets/prompt-vault-oF1IGD75.js",
+    "file": "assets/prompt-vault-BRT0kVUm.js",
     "name": "index",
     "src": "index.html",
     "isEntry": true,
@@ -113,7 +113,7 @@
       "src/ComparatorDiff.tsx"
     ],
     "css": [
-      "assets/index-BWTRb7Vz.css"
+      "assets/index-CS0cO5dW.css"
     ],
     "assets": [
       "assets/geist-cyrillic-wght-normal-CHSlOQsW.woff2",

@@ -2,7 +2,7 @@
 
 import { once } from "node:events";
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,12 +11,13 @@ import { serve } from "@hono/node-server";
 import { createAuthorizationStore } from "../core/authorization.js";
 import { createPromptVault } from "../core/prompt-vault.js";
 import { createHttpApp } from "../server/app.js";
+import { HOST_VERSION } from "../server/version.js";
 import { addMalformedTheme, copyLegacyWorkspace } from "../test/workspace.js";
 
 const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64");
 
 async function runCli(args: string[], env: Record<string, string>) {
-  const child = spawn(process.execPath, ["packages/cli/dist/index.js", ...args], {
+  const child = spawn(process.execPath, ["packages/cli/dist/cli/index.js", ...args], {
     cwd: process.cwd(),
     env: { ...process.env, ...env },
     stdio: ["ignore", "pipe", "pipe"],
@@ -29,15 +30,57 @@ async function runCli(args: string[], env: Record<string, string>) {
   return { code, stdout, stderr };
 }
 
-async function waitForPendingRequest(host: string, token: string) {
-  return (await waitForPendingRequests(host, token, 1))[0];
+function spawnCli(args: string[], env: Record<string, string>) {
+  return spawn(process.execPath, ["packages/cli/dist/cli/index.js", ...args], {
+    cwd: process.cwd(),
+    env: { ...process.env, ...env },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
 }
 
-async function waitForPendingRequests(host: string, token: string, count: number) {
+async function waitForJsonLine(child: ReturnType<typeof spawnCli>) {
+  return new Promise<unknown>((resolve, reject) => {
+    let stdout = "";
+    let stderr = "";
+    const timeout = setTimeout(() => reject(new Error(`CLI did not become ready. stderr: ${stderr}`)), 15_000);
+    child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+    child.stdout.setEncoding("utf8").on("data", (chunk) => {
+      stdout += chunk;
+      const newline = stdout.indexOf("\n");
+      if (newline === -1) return;
+      clearTimeout(timeout);
+      try {
+        resolve(JSON.parse(stdout.slice(0, newline)));
+      } catch (error) {
+        reject(error);
+      }
+    });
+    child.once("error", reject);
+    child.once("close", (code) => reject(new Error(`CLI exited before readiness (${code}). stderr: ${stderr}`)));
+  });
+}
+
+async function unusedPort() {
+  const server = createServer();
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("Expected TCP test server");
+  const port = address.port;
+  server.close();
+  await once(server, "close");
+  return port;
+}
+
+async function waitForPendingRequest(host: string, cookie: string) {
+  return (await waitForPendingRequests(host, cookie, 1))[0];
+}
+
+async function waitForPendingRequests(host: string, cookie: string, count: number) {
   for (let attempt = 0; attempt < 100; attempt += 1) {
-    const response = await fetch(`${host}/api/v2/auth/requests`, { headers: { Authorization: `Bearer ${token}` } });
+    const response = await fetch(`${host}/api/v2/auth/requests`, { headers: { Cookie: cookie } });
     if (response.ok) {
-      const requests = await response.json() as Array<{ requestId: string; userCode: string }>;
+      const requests = await response.json() as Array<{ id: string; userCode: string }>;
       if (requests.length >= count) return requests;
     }
     await new Promise((resolve) => setTimeout(resolve, 10));
@@ -78,12 +121,41 @@ describe("prompt-vault CLI process", () => {
     });
   });
 
+  it("initializes a managed local full-stack instance and remembers it as the default", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "prompt-vault-cli-init-"));
+    const instanceDirectory = join(directory, "instance");
+    const configDirectory = join(directory, "config");
+    const env = { PROMPT_VAULT_CONFIG_DIR: configDirectory, PROMPT_VAULT_CREDENTIAL_STORE: "file" };
+
+    const initialized = await runCli([
+      "init", "--directory", instanceDirectory, "--port", "18767",
+    ], env);
+
+    expect(initialized).toMatchObject({ code: 0, stderr: "" });
+    expect(JSON.parse(initialized.stdout)).toEqual({
+      ok: true,
+      data: {
+        state: "initialized",
+        directory: instanceDirectory,
+        url: "http://127.0.0.1:18767",
+      },
+    });
+    expect(JSON.parse(await readFile(join(instanceDirectory, ".prompt-vault", "instance.json"), "utf8"))).toMatchObject({
+      format: "prompt-vault/instance/v1",
+      id: expect.stringMatching(/^[A-Za-z0-9_-]{22}$/),
+      bind: "127.0.0.1",
+      port: 18767,
+      publicOrigin: "http://127.0.0.1:18767",
+    });
+    expect(JSON.parse(await readFile(join(configDirectory, "config.json"), "utf8"))).toMatchObject({ localInstance: instanceDirectory });
+  });
+
   it("rejects a cross-origin browser verification URI from a hostile host", async () => {
     const server = createServer((request, response) => {
       response.setHeader("Content-Type", "application/json");
       if (request.url === "/api/v2/auth/device") {
         response.end(JSON.stringify({
-          requestId: "1234567890123456",
+          deviceCode: "12345678901234567890123456789012",
           userCode: "ABCD1234",
           verificationUri: "https://attacker.example/authorize",
           expiresIn: 600,
@@ -111,22 +183,212 @@ describe("prompt-vault CLI process", () => {
     }
   });
 
+  it("requires explicit acknowledgement for bearer authorization over remote HTTP", async () => {
+    const result = await runCli(["connect", "http://192.0.2.10:8767", "--name", "insecure", "--no-browser"], {});
+
+    expect(result).toMatchObject({ code: 2, stderr: "" });
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      ok: false,
+      error: { code: "INSECURE_HOST" },
+    });
+  });
+
+  it("does not send stored credentials over remote HTTP without a persisted acknowledgement", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "prompt-vault-cli-insecure-config-"));
+    await writeFile(join(directory, "config.json"), JSON.stringify({
+      currentHost: "unacknowledged-http",
+      localInstance: null,
+      hosts: { "unacknowledged-http": { url: "http://192.0.2.10:8767", allowInsecureHttp: false, ownership: "external" } },
+    }));
+    await writeFile(join(directory, "credentials.json"), JSON.stringify({ tokens: { "unacknowledged-http": "pv_unacknowledged" } }));
+
+    const result = await runCli(["theme", "list"], {
+      PROMPT_VAULT_CONFIG_DIR: directory,
+      PROMPT_VAULT_CREDENTIAL_STORE: "file",
+    });
+
+    expect(result).toMatchObject({ code: 2, stderr: "" });
+    expect(JSON.parse(result.stdout)).toMatchObject({ ok: false, error: { code: "INSECURE_HOST" } });
+
+    const logout = await runCli(["auth", "logout"], {
+      PROMPT_VAULT_CONFIG_DIR: directory,
+      PROMPT_VAULT_CREDENTIAL_STORE: "file",
+    });
+    expect(logout.code).toBe(2);
+    expect(JSON.parse(logout.stdout)).toMatchObject({ ok: false, error: { code: "INSECURE_HOST" } });
+    expect(JSON.parse(await readFile(join(directory, "credentials.json"), "utf8"))).toMatchObject({
+      tokens: { "unacknowledged-http": "pv_unacknowledged" },
+    });
+  });
+
+  it("lazily initializes without replacing the selected External Host", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "prompt-vault-cli-lazy-"));
+    const instanceDirectory = join(directory, "Prompt Vault Data");
+    const configDirectory = join(directory, "config");
+    await mkdir(configDirectory, { recursive: true });
+    await writeFile(join(configDirectory, "config.json"), JSON.stringify({
+      currentHost: "production",
+      localInstance: null,
+      hosts: { production: { url: "https://vault.example.com", allowInsecureHttp: false, ownership: "external" } },
+    }));
+    const env = { PROMPT_VAULT_CONFIG_DIR: configDirectory, PROMPT_VAULT_CREDENTIAL_STORE: "file" };
+    const child = spawnCli(["serve", "--directory", instanceDirectory, "--name", "local-test", "--no-browser"], env);
+
+    try {
+      const ready = await waitForJsonLine(child);
+      expect(ready).toMatchObject({ ok: true, data: { state: "serving", selected: false, url: `http://127.0.0.1:8767` } });
+      expect(JSON.parse(await readFile(join(instanceDirectory, ".prompt-vault", "instance.json"), "utf8"))).toMatchObject({
+        format: "prompt-vault/instance/v1",
+      });
+      expect(JSON.parse(await readFile(join(configDirectory, "config.json"), "utf8"))).toMatchObject({
+        currentHost: "production",
+        localInstance: instanceDirectory,
+        hosts: { "local-test": { ownership: "managed-local" }, production: { ownership: "external" } },
+      });
+    } finally {
+      if (child.exitCode === null) {
+        child.kill("SIGTERM");
+        await once(child, "close").catch(() => undefined);
+      }
+    }
+  }, 25_000);
+
+  it("serves a managed local Host and authorizes routine CLI commands", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "prompt-vault-cli-serve-"));
+    const instanceDirectory = join(directory, "Prompt Vault Data");
+    const configDirectory = join(directory, "config");
+    const port = await unusedPort();
+    const env = { PROMPT_VAULT_CONFIG_DIR: configDirectory, PROMPT_VAULT_CREDENTIAL_STORE: "file" };
+    expect((await runCli(["init", "--directory", instanceDirectory, "--port", String(port)], env)).code).toBe(0);
+    const child = spawnCli(["serve", "--directory", instanceDirectory, "--name", "local-test", "--no-browser"], env);
+
+    try {
+      const ready = await waitForJsonLine(child);
+      expect(ready).toMatchObject({
+        ok: true,
+        data: { state: "serving", directory: instanceDirectory, host: "local-test", url: `http://127.0.0.1:${port}`, selected: true },
+      });
+      const health = await fetch(`http://127.0.0.1:${port}/healthz`).then((response) => response.json());
+      expect(health).toMatchObject({ status: "ok", instanceId: expect.stringMatching(/^[A-Za-z0-9_-]{22}$/), version: expect.any(String) });
+      expect(JSON.parse((await runCli(["theme", "list"], env)).stdout)).toEqual({ ok: true, data: [] });
+      expect(JSON.parse((await runCli(["status", "--check"], env)).stdout)).toMatchObject({
+        ok: true,
+        data: { currentHost: "local-test", authenticated: true, identity: { kind: "cli" } },
+      });
+    } finally {
+      if (child.exitCode === null) {
+        child.kill("SIGTERM");
+        await once(child, "close").catch(() => undefined);
+      }
+    }
+  }, 25_000);
+
+  it("identifies the same managed instance already occupying its listener", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "prompt-vault-cli-collision-"));
+    const instanceDirectory = join(directory, "instance");
+    const configDirectory = join(directory, "config");
+    const port = await unusedPort();
+    const env = { PROMPT_VAULT_CONFIG_DIR: configDirectory, PROMPT_VAULT_CREDENTIAL_STORE: "file" };
+    expect((await runCli(["init", "--directory", instanceDirectory, "--port", String(port)], env)).code).toBe(0);
+    const instance = JSON.parse(await readFile(join(instanceDirectory, ".prompt-vault", "instance.json"), "utf8")) as { id: string };
+    const occupant = createServer((request, response) => {
+      response.setHeader("Content-Type", "application/json");
+      response.end(JSON.stringify(request.url === "/healthz" ? { status: "ok", instanceId: instance.id, version: "1.2.0" } : {}));
+    });
+    occupant.listen(port, "127.0.0.1");
+    await once(occupant, "listening");
+
+    try {
+      const result = await runCli(["serve", "--directory", instanceDirectory, "--no-browser"], env);
+      expect(result).toMatchObject({ code: 3, stderr: "" });
+      expect(JSON.parse(result.stdout)).toMatchObject({ ok: false, error: { code: "ALREADY_RUNNING" } });
+    } finally {
+      occupant.close();
+      await once(occupant, "close");
+    }
+  });
+
+  it("reports an unreachable selected Host without claiming that it is stopped", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "prompt-vault-cli-status-"));
+    const port = await unusedPort();
+    await writeFile(join(directory, "config.json"), JSON.stringify({
+      currentHost: "unavailable",
+      localInstance: null,
+      hosts: { unavailable: { url: `http://127.0.0.1:${port}`, allowInsecureHttp: false, ownership: "external" } },
+    }));
+    await writeFile(join(directory, "credentials.json"), JSON.stringify({ tokens: { unavailable: "pv_unavailable" } }));
+
+    const result = await runCli(["status", "--check"], {
+      PROMPT_VAULT_CONFIG_DIR: directory,
+      PROMPT_VAULT_CREDENTIAL_STORE: "file",
+    });
+
+    expect(result).toMatchObject({ code: 3, stderr: "" });
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      ok: true,
+      data: { currentHost: "unavailable", state: "unavailable", reachable: false, authenticated: false },
+    });
+  });
+
+  it("fails status checks for an authenticated Host with an incompatible major version", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "prompt-vault-cli-incompatible-"));
+    const server = createServer((request, response) => {
+      response.setHeader("Content-Type", "application/json");
+      response.end(JSON.stringify(request.url === "/healthz"
+        ? { status: "ok", version: "2.0.0" }
+        : { kind: "cli", id: "test", label: "Test CLI" }));
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Expected TCP test server");
+    await writeFile(join(directory, "config.json"), JSON.stringify({
+      currentHost: "incompatible",
+      localInstance: null,
+      hosts: { incompatible: { url: `http://127.0.0.1:${address.port}`, allowInsecureHttp: false, ownership: "external" } },
+    }));
+    await writeFile(join(directory, "credentials.json"), JSON.stringify({ tokens: { incompatible: "pv_incompatible" } }));
+
+    try {
+      const result = await runCli(["status", "--check"], {
+        PROMPT_VAULT_CONFIG_DIR: directory,
+        PROMPT_VAULT_CREDENTIAL_STORE: "file",
+      });
+      expect(result.code).toBe(3);
+      expect(JSON.parse(result.stdout)).toMatchObject({
+        ok: true,
+        data: { state: "incompatible", interfaceCompatible: false, authenticated: true, hostVersion: "2.0.0" },
+      });
+    } finally {
+      server.close();
+      await once(server, "close");
+    }
+  });
+
   it("configures a Vault Host through browser approval and revokes it on logout", async () => {
     const directory = await mkdtemp(join(tmpdir(), "prompt-vault-cli-auth-"));
     const configDirectory = join(directory, "config");
     const workspace = await copyLegacyWorkspace();
     await addMalformedTheme(workspace);
-    const authorization = await createAuthorizationStore({ credentialDirectory: join(directory, "host-credentials") });
+    const authorization = await createAuthorizationStore({ credentialDirectory: join(directory, "host-credentials"), pollIntervalMs: 0 });
     const app = createHttpApp({
       vault: createPromptVault({ workspace }),
       token: "host-token",
       authorization,
+      version: HOST_VERSION,
     });
     const server = serve({ fetch: app.fetch, port: 0, createServer });
     await once(server, "listening");
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("Expected TCP test server");
     const host = `http://127.0.0.1:${address.port}`;
+    const browserLogin = await fetch(`${host}/api/v2/auth/browser`, {
+      method: "POST",
+      headers: { Origin: host, "Sec-Fetch-Site": "same-origin", "Content-Type": "application/json" },
+      body: JSON.stringify({ token: "host-token" }),
+    });
+    expect(browserLogin.status).toBe(204);
+    const browserCookie = (browserLogin.headers.get("set-cookie") || "").split(";")[0];
     const env = {
       PROMPT_VAULT_CONFIG_DIR: configDirectory,
       PROMPT_VAULT_CREDENTIAL_STORE: "file",
@@ -134,16 +396,16 @@ describe("prompt-vault CLI process", () => {
 
     try {
       const login = runCli(["connect", host, "--name", "test", "--no-browser"], env);
-      const pending = await waitForPendingRequest(host, "host-token");
-      const approval = await fetch(`${host}/api/v2/auth/device/${pending.requestId}/approve`, {
+      const pending = await waitForPendingRequest(host, browserCookie);
+      const approval = await fetch(`${host}/api/v2/auth/device/approve`, {
         method: "POST",
-        headers: { Authorization: "Bearer host-token", "Content-Type": "application/json" },
+        headers: { Cookie: browserCookie, Origin: host, "Sec-Fetch-Site": "same-origin", "Content-Type": "application/json" },
         body: JSON.stringify({ userCode: pending.userCode }),
       });
       expect(approval.status).toBe(204);
       const loggedIn = await login;
       expect(loggedIn.code).toBe(0);
-      expect(loggedIn.stderr).toContain(`Open ${host}/auth/cli/`);
+      expect(loggedIn.stderr).toContain(`Open ${host}/auth/cli?code=`);
       expect(loggedIn.stderr).toContain(`Code: ${pending.userCode}`);
       expect(loggedIn.stdout).not.toContain("pv_");
       expect(JSON.parse(loggedIn.stdout)).toMatchObject({ ok: true, data: { host: "test", authenticated: true } });
@@ -161,20 +423,24 @@ describe("prompt-vault CLI process", () => {
       expect(requestPayload).toMatchObject({ host: "test", url: host, userCode: expect.stringMatching(/^[A-Z0-9]{8}$/) });
       expect(requestPayload).not.toHaveProperty("token");
       const pendingCompletion = await runCli([
-        "--json", "--host", host, "auth", "complete", "--name", "test", "--request", requestPayload.requestId,
+        "--json", "--host", host, "auth", "complete", "--name", "test", "--device-code", requestPayload.deviceCode,
       ], env);
       expect(JSON.parse(pendingCompletion.stdout)).toEqual({ ok: true, data: { status: "pending", host: "test", url: host } });
-      expect((await fetch(`${host}/api/v2/auth/device/${requestPayload.requestId}/approve`, {
+      expect((await fetch(`${host}/api/v2/auth/device/approve`, {
         method: "POST",
-        headers: { Authorization: "Bearer host-token", "Content-Type": "application/json" },
+        headers: { Cookie: browserCookie, Origin: host, "Sec-Fetch-Site": "same-origin", "Content-Type": "application/json" },
         body: JSON.stringify({ userCode: requestPayload.userCode }),
       })).status).toBe(204);
       const completed = await runCli([
-        "--json", "--host", host, "auth", "complete", "--name", "test", "--request", requestPayload.requestId,
+        "--json", "--host", host, "auth", "complete", "--name", "test", "--device-code", requestPayload.deviceCode,
       ], env);
       expect(JSON.parse(completed.stdout)).toMatchObject({ ok: true, data: { status: "approved", host: "test", url: host, authenticated: true } });
       expect(completed.stdout).not.toContain("pv_");
-      expect((await fetch(`${host}/api/v2/auth/device/${requestPayload.requestId}`)).status).toBe(404);
+      expect((await fetch(`${host}/api/v2/auth/device/token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ deviceCode: requestPayload.deviceCode }),
+      })).status).toBe(404);
 
       const status = await runCli(["--json", "auth", "status", "--host", "test"], env);
       expect(JSON.parse(status.stdout)).toMatchObject({
@@ -295,19 +561,26 @@ describe("prompt-vault CLI process", () => {
       const hosts = await runCli(["--json", "host", "list"], env);
       expect(JSON.parse(hosts.stdout)).toEqual({
         ok: true,
-        data: [{ name: "test", url: host, current: true, authenticated: true }],
+        data: [{
+          name: "test",
+          url: host,
+          current: true,
+          authenticated: true,
+          ownership: "external",
+          allowInsecureHttp: false,
+        }],
       });
 
       const relogin = runCli(["--json", "auth", "login", "--host", host, "--name", "test", "--no-browser"], env);
-      const replacement = await waitForPendingRequest(host, "host-token");
-      expect((await fetch(`${host}/api/v2/auth/device/${replacement.requestId}/approve`, {
+      const replacement = await waitForPendingRequest(host, browserCookie);
+      expect((await fetch(`${host}/api/v2/auth/device/approve`, {
         method: "POST",
-        headers: { Authorization: "Bearer host-token", "Content-Type": "application/json" },
+        headers: { Cookie: browserCookie, Origin: host, "Sec-Fetch-Site": "same-origin", "Content-Type": "application/json" },
         body: JSON.stringify({ userCode: replacement.userCode }),
       })).status).toBe(204);
       expect((await relogin).code).toBe(0);
       const credentials = await fetch(`${host}/api/v2/auth/credentials`, {
-        headers: { Authorization: "Bearer host-token" },
+        headers: { Cookie: browserCookie },
       });
       expect(await credentials.json()).toHaveLength(1);
 
@@ -315,10 +588,10 @@ describe("prompt-vault CLI process", () => {
         ["--json", "auth", "login", "--host", host, "--name", name, "--no-browser"],
         env,
       ));
-      const concurrentRequests = await waitForPendingRequests(host, "host-token", 2);
-      await Promise.all(concurrentRequests.map((request) => fetch(`${host}/api/v2/auth/device/${request.requestId}/approve`, {
+      const concurrentRequests = await waitForPendingRequests(host, browserCookie, 2);
+      await Promise.all(concurrentRequests.map((request) => fetch(`${host}/api/v2/auth/device/approve`, {
         method: "POST",
-        headers: { Authorization: "Bearer host-token", "Content-Type": "application/json" },
+        headers: { Cookie: browserCookie, Origin: host, "Sec-Fetch-Site": "same-origin", "Content-Type": "application/json" },
         body: JSON.stringify({ userCode: request.userCode }),
       })));
       expect((await Promise.all(concurrentLogins)).map((result) => result.code)).toEqual([0, 0]);
@@ -338,19 +611,18 @@ describe("prompt-vault CLI process", () => {
         ...env,
         PROMPT_VAULT_CONFIG_DIR: blockedConfig,
       });
-      const unsavedRequest = await waitForPendingRequest(host, "host-token");
-      expect((await fetch(`${host}/api/v2/auth/device/${unsavedRequest.requestId}/approve`, {
+      const unsavedRequest = await waitForPendingRequest(host, browserCookie);
+      expect((await fetch(`${host}/api/v2/auth/device/approve`, {
         method: "POST",
-        headers: { Authorization: "Bearer host-token", "Content-Type": "application/json" },
+        headers: { Cookie: browserCookie, Origin: host, "Sec-Fetch-Site": "same-origin", "Content-Type": "application/json" },
         body: JSON.stringify({ userCode: unsavedRequest.userCode }),
       })).status).toBe(204);
       const failedLoginResult = await failedLogin;
       expect(failedLoginResult.code).toBe(4);
-      expect(failedLoginResult.stderr).toContain(`Open ${host}/auth/cli/`);
+      expect(failedLoginResult.stderr).toContain(`Open ${host}/auth/cli?code=`);
       expect(JSON.parse(failedLoginResult.stdout)).toMatchObject({ ok: false, error: { code: "CREDENTIAL_SAVE_FAILED_REVOKED" } });
-      expect((await fetch(`${host}/api/v2/auth/device/${unsavedRequest.requestId}`)).status).toBe(404);
       const credentialsAfterFailedLogin = await fetch(`${host}/api/v2/auth/credentials`, {
-        headers: { Authorization: "Bearer host-token" },
+        headers: { Cookie: browserCookie },
       });
       expect(await credentialsAfterFailedLogin.json()).toHaveLength(3);
 

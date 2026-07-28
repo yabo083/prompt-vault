@@ -12,12 +12,14 @@ export type CliIdentity = {
 export type CredentialSummary = CliIdentity & { createdAt: string };
 
 export type DeviceRequest = {
-  requestId: string;
+  id: string;
   userCode: string;
   label: string;
   expiresAt: number;
-  token?: string;
-  approving?: boolean;
+  approved?: boolean;
+  exchanging?: boolean;
+  denied?: boolean;
+  nextPollAt?: number;
 };
 
 export class AuthorizationError extends Error {
@@ -29,17 +31,19 @@ export class AuthorizationError extends Error {
 
 export interface AuthorizationStore {
   createDeviceRequest(input: { label: string; verificationOrigin: string }): Promise<{
-    requestId: string;
+    deviceCode: string;
     userCode: string;
     verificationUri: string;
     expiresIn: number;
     interval: number;
   }>;
-  inspectDeviceRequest(requestId: string, userCode: string): Promise<Pick<DeviceRequest, "requestId" | "userCode" | "label" | "expiresAt"> | null>;
-  pollDeviceRequest(requestId: string): Promise<{ status: "pending" } | { status: "approved"; token: string } | { status: "expired" } | null>;
-  discardDeviceRequest(requestId: string): Promise<boolean>;
-  listPendingRequests(): Promise<Array<Pick<DeviceRequest, "requestId" | "userCode" | "label" | "expiresAt">>>;
-  approveDeviceRequest(requestId: string, userCode: string): Promise<boolean>;
+  inspectDeviceRequest(userCode: string): Promise<Pick<DeviceRequest, "id" | "userCode" | "label" | "expiresAt"> | null>;
+  exchangeDeviceCode(deviceCode: string): Promise<{ status: "pending" } | { status: "slow_down"; interval: number } | { status: "approved"; token: string } | { status: "denied" } | { status: "expired" } | null>;
+  discardDeviceRequest(deviceCode: string): Promise<boolean>;
+  listPendingRequests(): Promise<Array<Pick<DeviceRequest, "id" | "userCode" | "label" | "expiresAt">>>;
+  approveDeviceRequest(userCode: string): Promise<boolean>;
+  denyDeviceRequest(userCode: string): Promise<boolean>;
+  issueCredential(label: string): Promise<{ identity: CliIdentity; token: string }>;
   authenticate(token: string): Promise<CliIdentity | null>;
   listCredentials(): Promise<CredentialSummary[]>;
   revoke(token: string): Promise<boolean>;
@@ -98,10 +102,12 @@ export async function createAuthorizationStore({
   credentialDirectory,
   now = () => Date.now(),
   maxPending = 20,
+  pollIntervalMs = 1_000,
 }: {
   credentialDirectory: string;
   now?: () => number;
   maxPending?: number;
+  pollIntervalMs?: number;
 }): Promise<AuthorizationStore> {
   await mkdir(credentialDirectory, { recursive: true, mode: 0o700 });
   const pending = new Map<string, DeviceRequest>();
@@ -112,75 +118,105 @@ export async function createAuthorizationStore({
     }
   }
 
-  function inspect(requestId: string, userCode: string) {
-    const request = pending.get(requestId);
-    if (!request || request.expiresAt <= now() || !equalText(request.userCode, userCode.toUpperCase())) return null;
-    return request;
+  function inspectUserCode(userCode: string) {
+    const normalized = userCode.replace(/[^A-Z0-9]/gi, "").toUpperCase();
+    return [...pending.values()].find((request) => request.expiresAt > now() && equalText(request.userCode, normalized)) || null;
+  }
+
+  async function issueCredential(label: string) {
+    const token = `pv_${randomBytes(32).toString("base64url")}`;
+    const identity: CliIdentity = {
+      kind: "cli",
+      id: randomBytes(12).toString("base64url"),
+      label: label.trim().slice(0, 80) || "Prompt Vault CLI",
+    };
+    await writeCredential(credentialDirectory, {
+      id: identity.id,
+      label: identity.label,
+      tokenHash: tokenHash(token),
+      createdAt: new Date(now()).toISOString(),
+    });
+    return { identity, token };
   }
 
   return {
     async createDeviceRequest({ label, verificationOrigin }) {
       discardExpired();
-      const awaitingApproval = [...pending.values()].filter((request) => !request.token).length;
+      const awaitingApproval = [...pending.values()].filter((request) => !request.approved && !request.denied).length;
       if (awaitingApproval >= maxPending) throw new AuthorizationError("TOO_MANY_REQUESTS", "Too many pending CLI authorization requests");
-      const requestId = randomBytes(24).toString("base64url");
-      const userCode = randomBytes(6).toString("base64url").replace(/[-_]/g, "A").slice(0, 8).toUpperCase();
+      const id = randomBytes(12).toString("base64url");
+      const deviceCode = randomBytes(32).toString("base64url");
+      let userCode = "";
+      do {
+        userCode = randomBytes(6).toString("base64url").replace(/[-_]/g, "A").slice(0, 8).toUpperCase();
+      } while (inspectUserCode(userCode));
       const expiresIn = 600;
       const normalizedLabel = label.trim().slice(0, 80) || "Prompt Vault CLI";
-      pending.set(requestId, { requestId, userCode, label: normalizedLabel, expiresAt: now() + expiresIn * 1_000 });
+      pending.set(tokenHash(deviceCode), { id, userCode, label: normalizedLabel, expiresAt: now() + expiresIn * 1_000 });
       return {
-        requestId,
+        deviceCode,
         userCode,
-        verificationUri: `${verificationOrigin.replace(/\/$/, "")}/auth/cli/${requestId}?code=${userCode}`,
+        verificationUri: `${verificationOrigin.replace(/\/$/, "")}/auth/cli?code=${userCode}`,
         expiresIn,
-        interval: 1,
+        interval: pollIntervalMs / 1_000,
       };
     },
 
-    async inspectDeviceRequest(requestId, userCode) {
-      const request = inspect(requestId, userCode);
-      return request ? { requestId: request.requestId, userCode: request.userCode, label: request.label, expiresAt: request.expiresAt } : null;
+    async inspectDeviceRequest(userCode) {
+      const request = inspectUserCode(userCode);
+      return request ? { id: request.id, userCode: request.userCode, label: request.label, expiresAt: request.expiresAt } : null;
     },
 
-    async pollDeviceRequest(requestId) {
-      const request = pending.get(requestId);
+    async exchangeDeviceCode(deviceCode) {
+      const key = tokenHash(deviceCode);
+      const request = pending.get(key);
       if (!request) return null;
       if (request.expiresAt <= now()) {
-        pending.delete(requestId);
+        pending.delete(key);
         return { status: "expired" };
       }
-      if (!request.token) return { status: "pending" };
-      return { status: "approved", token: request.token };
+      if (request.nextPollAt !== undefined && request.nextPollAt > now()) return { status: "slow_down", interval: pollIntervalMs / 1_000 };
+      request.nextPollAt = now() + pollIntervalMs;
+      if (request.denied) {
+        pending.delete(key);
+        return { status: "denied" };
+      }
+      if (!request.approved) return { status: "pending" };
+      if (request.exchanging) return { status: "slow_down", interval: pollIntervalMs / 1_000 };
+      request.exchanging = true;
+      try {
+        const credential = await issueCredential(request.label);
+        pending.delete(key);
+        return { status: "approved", token: credential.token };
+      } finally {
+        request.exchanging = false;
+      }
     },
 
-    async discardDeviceRequest(requestId: string) {
-      return pending.delete(requestId);
+    async discardDeviceRequest(deviceCode: string) {
+      return pending.delete(tokenHash(deviceCode));
     },
 
     async listPendingRequests() {
       discardExpired();
-      return [...pending.values()].filter((request) => !request.token).map(({ requestId, userCode, label, expiresAt }) => ({ requestId, userCode, label, expiresAt }));
+      return [...pending.values()].filter((request) => !request.approved && !request.denied).map(({ id, userCode, label, expiresAt }) => ({ id, userCode, label, expiresAt }));
     },
 
-    async approveDeviceRequest(requestId, userCode) {
-      const request = inspect(requestId, userCode);
-      if (!request || request.token || request.approving) return false;
-      request.approving = true;
-      const token = `pv_${randomBytes(32).toString("base64url")}`;
-      const credential: Credential = {
-        id: randomBytes(12).toString("base64url"),
-        label: request.label,
-        tokenHash: tokenHash(token),
-        createdAt: new Date(now()).toISOString(),
-      };
-      try {
-        await writeCredential(credentialDirectory, credential);
-        request.token = token;
-        return true;
-      } finally {
-        request.approving = false;
-      }
+    async approveDeviceRequest(userCode) {
+      const request = inspectUserCode(userCode);
+      if (!request || request.approved || request.denied) return false;
+      request.approved = true;
+      return true;
     },
+
+    async denyDeviceRequest(userCode) {
+      const request = inspectUserCode(userCode);
+      if (!request || request.approved || request.denied) return false;
+      request.denied = true;
+      return true;
+    },
+
+    issueCredential,
 
     async authenticate(token) {
       if (!token) return null;

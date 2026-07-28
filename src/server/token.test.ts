@@ -16,7 +16,7 @@ describe("Vault Host token", () => {
     expect(await readFile(tokenFile, "utf8")).toBe("existing-token\n");
   });
 
-  it("creates a non-empty host token when no environment or file token exists", async () => {
+  it("creates a non-empty host token when no token file exists", async () => {
     const directory = await mkdtemp(join(tmpdir(), "prompt-vault-token-"));
     const tokenFile = join(directory, ".vault-token");
 

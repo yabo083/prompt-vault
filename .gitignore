@@ -2,6 +2,8 @@ node_modules/
 /dist/
 /packages/cli/dist/
 /packages/cli/LICENSE
+/packages/cli/static/
+/artifacts/
 frontend/node_modules/
 frontend/dist/
 *.tsbuildinfo

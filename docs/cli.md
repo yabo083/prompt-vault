@@ -1,6 +1,6 @@
-# Command-Line Client
+# Command-Line Runtime And Client
 
-The `prompt-vault` CLI operates Vault Hosts through `/api/v2`. It never reads or writes a server workspace directly.
+The `prompt-vault` package runs a Managed Local Host or operates an External Host through `/api/v2`. The Vault Host remains the sole workspace writer.
 
 ## Install
 
@@ -9,15 +9,35 @@ Node.js 20.20 or newer is required.
 ```bash
 npm install --global @miyako-lab/prompt-vault-cli
 prompt-vault --version
+prompt-vault serve
 ```
 
 To build the CLI from source:
 
 ```bash
 npm ci
-npm run build:cli
-node packages/cli/dist/index.js --help
+npm run build
+node packages/cli/dist/cli/index.js --help
 ```
+
+## Managed Local Host
+
+The shortest local path is:
+
+```bash
+prompt-vault serve
+```
+
+The first run transactionally initializes `~/PromptVault`, serves the API and compiled Web UI from one process, authorizes the local CLI, and opens the browser in an interactive terminal. The process remains attached; press `Ctrl+C` to stop it.
+
+Provision an explicit location before serving when needed:
+
+```bash
+prompt-vault init --directory D:\PromptVault --port 8767
+prompt-vault serve --directory D:\PromptVault --name local
+```
+
+Serving local does not replace an already selected External Host unless `--use` is passed. `--no-browser` suppresses browser opening; `--open` requests it outside an interactive terminal. Neither option detaches the Host.
 
 The CLI stores a current Vault Host, similar to a kubectl context or default cloud profile. Routine commands use it automatically. Agent pipes receive a stable machine-readable envelope automatically; use `--json` only to force that format in an interactive terminal and `--host <name-or-url>` only for a one-command override.
 
@@ -31,7 +51,7 @@ For an interactive terminal, start the complete device flow:
 prompt-vault connect https://vault.example.com --name home
 ```
 
-The CLI opens the Vault Host's approval page and prints a short code. Sign in to the Vault Host with its Host Token, then approve the CLI request. The resulting CLI credential is stored in the operating system keyring on macOS and Windows, or in a mode-`0600` configuration file on Linux.
+The CLI opens the Vault Host's approval page and prints a short code. Sign in to the Vault Host, then approve the CLI request. The resulting CLI credential is stored in the operating system keyring when available, with a mode-`0600` file fallback.
 
 The Host Token is never copied into CLI configuration.
 
@@ -43,10 +63,10 @@ Agents whose shell tools do not stream a running process should use the non-bloc
 prompt-vault --host https://vault.example.com auth request --name home
 ```
 
-The response contains `verificationUri`, `userCode`, and `requestId`, but no credential. After the user approves in a browser:
+The response contains `verificationUri`, `userCode`, and a secret `deviceCode`, but no credential. Keep `deviceCode` out of browser URLs and logs. After the user approves in a browser:
 
 ```bash
-prompt-vault --host https://vault.example.com auth complete --name home --request <requestId>
+prompt-vault --host https://vault.example.com auth complete --name home --device-code <deviceCode>
 ```
 
 A pending approval returns `data.status: "pending"`. A successful completion returns `data.status: "approved"` and stores the CLI credential.
@@ -136,7 +156,7 @@ prompt-vault workspace synchronize
 
 ## Security
 
-- Use HTTPS when the Vault Host crosses an untrusted network.
+- External Vault Hosts require HTTPS. Plaintext remote HTTP requires explicit `--allow-insecure-http` acknowledgement, which is stored with that named Host so later commands can enforce the same transport decision. Existing plaintext Host entries created by older CLI versions must be reconnected with the flag before credentials will be sent.
 - Never request, store, or pass the Host Token to the CLI.
 - Do not share CLI configuration or keyring entries between users.
 - Revoke temporary agent credentials with `auth logout` when the task ends.

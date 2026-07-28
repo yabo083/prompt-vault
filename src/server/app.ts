@@ -9,6 +9,8 @@ import { z, ZodError } from "zod";
 import { AuthorizationError, type AuthorizationStore, type CliIdentity } from "../core/authorization.js";
 import type { ApplyDraftEditInput, AssetKind, PromptVault } from "../core/types.js";
 import { VaultError } from "../core/types.js";
+import { createMemoryBrowserSessionStore, type BrowserSessionStore } from "./browser-sessions.js";
+import type { LocalLaunchAuthorization } from "./local-launch.js";
 
 type HostIdentity = { kind: "host"; label: "Vault Host" };
 type Identity = HostIdentity | CliIdentity;
@@ -126,7 +128,9 @@ const assetOrderInputSchema = z.object({ names: z.array(z.string().min(1).max(25
 const assetOrderEntrySchema = z.object({ source: z.enum(["existing", "upload"]), index: z.number().int().nonnegative() }).strict();
 const deviceRequestInputSchema = z.object({ label: z.string().max(200).optional() }).strict();
 const deviceApprovalInputSchema = z.object({ userCode: z.string() }).strict();
+const deviceTokenInputSchema = z.object({ deviceCode: z.string().min(32).max(200) }).strict();
 const browserLoginInputSchema = z.object({ token: z.string().min(1).max(10_000) }).strict();
+const localLaunchInputSchema = z.object({ nonce: z.string().min(32).max(200) }).strict();
 const saveRevisionInputSchema = z.object({
   note: z.string().max(20_000).optional(),
   parentIds: z.array(z.number().int().positive()).max(100).optional(),
@@ -166,6 +170,10 @@ export function createHttpApp({
   vault,
   token = "",
   authorization,
+  browserSessions = createMemoryBrowserSessionStore(),
+  localLaunch,
+  instanceId,
+  version,
   publicOrigin,
   trustedProxies = [],
   staticDirectory,
@@ -173,6 +181,10 @@ export function createHttpApp({
   vault: PromptVault;
   token?: string;
   authorization?: AuthorizationStore;
+  browserSessions?: BrowserSessionStore;
+  localLaunch?: LocalLaunchAuthorization;
+  instanceId?: string;
+  version?: string;
   publicOrigin?: string;
   trustedProxies?: string[];
   staticDirectory?: string;
@@ -181,37 +193,34 @@ export function createHttpApp({
   const app = new Hono<{ Variables: { identity: Identity } }>();
   const deviceAttempts = new Map<string, number[]>();
 
-  app.get("/healthz", (context) => context.json({ status: "ok" }));
+  app.get("/healthz", (context) => context.json({
+    status: "ok",
+    ...(instanceId ? { instanceId } : {}),
+    ...(version ? { version } : {}),
+  }));
 
   app.use("/api/v2/*", async (context, next) => {
     const path = context.req.path;
     const publicDeviceRequest = path === "/api/v2/auth/device" && context.req.method === "POST";
-    const publicDevicePoll = /^\/api\/v2\/auth\/device\/[^/]+$/.test(path) && new Set(["GET", "DELETE"]).has(context.req.method);
+    const publicDeviceToken = path === "/api/v2/auth/device/token" && new Set(["POST", "DELETE"]).has(context.req.method);
     const publicBrowserLogin = path === "/api/v2/auth/browser" && context.req.method === "POST";
-    if (publicDeviceRequest || publicDevicePoll || publicBrowserLogin) return next();
+    const publicLocalLaunch = path === "/api/v2/auth/launch" && context.req.method === "POST";
+    if (publicDeviceRequest || publicDeviceToken || publicBrowserLogin || publicLocalLaunch) return next();
     if (token || authorization) {
        const authorizationHeader = context.req.header("Authorization") || "";
-       const legacyToken = context.req.header("X-Vault-Token") || "";
-       const cookieToken = getCookie(context, "prompt_vault_token") || "";
-       const supplied = authorizationHeader.startsWith("Bearer ") ? authorizationHeader.slice(7) : legacyToken || cookieToken;
-       const usesCookie = Boolean(cookieToken && !authorizationHeader.startsWith("Bearer ") && !legacyToken);
+       const cookieSession = getCookie(context, "prompt_vault_session") || "";
+       const supplied = authorizationHeader.startsWith("Bearer ") ? authorizationHeader.slice(7) : "";
+       const usesCookie = Boolean(cookieSession && !authorizationHeader);
        if (usesCookie && !new Set(["GET", "HEAD", "OPTIONS"]).has(context.req.method)) {
          const origin = context.req.header("Origin");
-         if (!sameOrigin(origin, publicOrigin || context.req.url)) {
+         const fetchSite = context.req.header("Sec-Fetch-Site");
+         if (!sameOrigin(origin, publicOrigin || context.req.url) || (fetchSite && !new Set(["same-origin", "none"]).has(fetchSite))) {
            return context.json({ error: { code: "FORBIDDEN", message: "Cookie-authenticated mutations require a same-origin request" } }, 403);
          }
        }
-       if (token && equalToken(supplied, token)) {
-         context.set("identity", { kind: "host", label: "Vault Host" });
-         if (usesCookie) {
-           setCookie(context, "prompt_vault_token", token, {
-             httpOnly: true,
-             sameSite: "Strict",
-             secure: new URL(publicOrigin || context.req.url).protocol === "https:",
-             path: "/",
-           });
-         }
-       }
+       if (usesCookie && await browserSessions.authenticate(cookieSession)) {
+          context.set("identity", { kind: "host", label: "Vault Host" });
+        }
        else {
         const identity = await authorization?.authenticate(supplied);
         if (!identity) return context.json({ error: { code: "UNAUTHORIZED", message: "A valid Vault Host credential is required" } }, 401);
@@ -221,39 +230,69 @@ export function createHttpApp({
     await next();
   });
 
-  app.post("/api/v2/auth/browser", async (context) => {
-    if (!token) return context.json({ error: { code: "NOT_SUPPORTED", message: "Browser token authentication is not configured" } }, 501);
-    const input = browserLoginInputSchema.parse(await limitedJson(context.req.raw, 12 * 1024));
-    if (!equalToken(input.token, token)) return context.json({ error: { code: "UNAUTHORIZED", message: "The Vault Host token is invalid" } }, 401);
-    const origin = new URL(publicOrigin || context.req.url);
-    setCookie(context, "prompt_vault_token", token, {
+  app.post("/api/v2/auth/launch", async (context) => {
+    if (!localLaunch || !instanceId) return context.json({ error: { code: "NOT_FOUND", message: "Local browser launch is not available" } }, 404);
+    const origin = context.req.header("Origin");
+    if (!sameOrigin(origin, publicOrigin || context.req.url) || context.req.header("Sec-Fetch-Site") === "cross-site") {
+      return context.json({ error: { code: "FORBIDDEN", message: "Local browser launch requires a same-origin request" } }, 403);
+    }
+    const input = localLaunchInputSchema.parse(await limitedJson(context.req.raw, 1_024));
+    const result = localLaunch.claim({ nonce: input.nonce, origin: new URL(origin!).origin, instanceId });
+    context.header("Cache-Control", "no-store");
+    if (result === "expired") return context.json({ error: { code: "LAUNCH_EXPIRED", message: "The local browser launch link expired" } }, 410);
+    if (result !== "claimed") return context.json({ error: { code: "UNAUTHORIZED", message: "The local browser launch link is invalid" } }, 401);
+    const session = await browserSessions.create();
+    setCookie(context, "prompt_vault_session", session.token, {
       httpOnly: true,
       sameSite: "Strict",
-      secure: origin.protocol === "https:",
+      secure: new URL(publicOrigin || context.req.url).protocol === "https:",
       path: "/",
+      maxAge: Math.max(1, Math.floor((session.expiresAt.getTime() - Date.now()) / 1_000)),
+    });
+    return context.body(null, 204);
+  });
+
+  app.post("/api/v2/auth/browser", async (context) => {
+    if (!token) return context.json({ error: { code: "NOT_SUPPORTED", message: "Browser token authentication is not configured" } }, 501);
+    const origin = context.req.header("Origin");
+    const fetchSite = context.req.header("Sec-Fetch-Site");
+    if (!sameOrigin(origin, publicOrigin || context.req.url) || (fetchSite && !new Set(["same-origin", "none"]).has(fetchSite))) {
+      return context.json({ error: { code: "FORBIDDEN", message: "Browser authentication requires a same-origin request" } }, 403);
+    }
+    const input = browserLoginInputSchema.parse(await limitedJson(context.req.raw, 12 * 1024));
+    if (!equalToken(input.token, token)) return context.json({ error: { code: "UNAUTHORIZED", message: "The Vault Host token is invalid" } }, 401);
+    const canonicalOrigin = new URL(publicOrigin || context.req.url);
+    const session = await browserSessions.create();
+    setCookie(context, "prompt_vault_session", session.token, {
+      httpOnly: true,
+      sameSite: "Strict",
+      secure: canonicalOrigin.protocol === "https:",
+      path: "/",
+      maxAge: Math.max(1, Math.floor((session.expiresAt.getTime() - Date.now()) / 1_000)),
     });
     context.header("Cache-Control", "no-store");
     return context.body(null, 204);
   });
 
-  app.delete("/api/v2/auth/browser", (context) => {
+  app.delete("/api/v2/auth/browser", async (context) => {
     if (context.get("identity")?.kind !== "host") return context.json({ error: { code: "FORBIDDEN", message: "Vault Host authorization is required" } }, 403);
-    deleteCookie(context, "prompt_vault_token", { path: "/", secure: new URL(publicOrigin || context.req.url).protocol === "https:" });
+    const session = getCookie(context, "prompt_vault_session") || "";
+    if (session) await browserSessions.revoke(session);
+    deleteCookie(context, "prompt_vault_session", { path: "/", secure: new URL(publicOrigin || context.req.url).protocol === "https:" });
     context.header("Cache-Control", "no-store");
     return context.body(null, 204);
   });
 
-  app.get("/auth/cli/:requestId", async (context) => {
-    const requestId = context.req.param("requestId").replace(/[^A-Za-z0-9_-]/g, "");
+  app.get("/auth/cli", async (context) => {
     const userCode = (context.req.query("code") || "").replace(/[^A-Z0-9]/g, "");
-    const device = await authorization?.inspectDeviceRequest(requestId, userCode);
+    const device = await authorization?.inspectDeviceRequest(userCode);
     if (!device) return context.html("<!doctype html><title>Authorization request not found</title><h1>Authorization request not found</h1>", 404);
     const nonce = randomBytes(18).toString("base64");
     context.header("Content-Security-Policy", `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'`);
     context.header("X-Frame-Options", "DENY");
     context.header("Cache-Control", "no-store");
     context.header("Referrer-Policy", "no-referrer");
-    return context.html(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Authorize Prompt Vault CLI</title><style>body{font-family:system-ui;max-width:36rem;margin:4rem auto;padding:0 1rem}button{padding:.65rem 1rem}</style></head><body><main><h1>Authorize Prompt Vault CLI</h1><p>Application: <strong>${escapeHtml(device.label)}</strong></p><p>Code: <strong>${device.userCode}</strong></p><button id="approve">Approve</button><p id="status" role="status"></p></main><script nonce="${nonce}">document.getElementById('approve').onclick=async()=>{const response=await fetch('/api/v2/auth/device/${device.requestId}/approve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({userCode:'${device.userCode}'})});document.getElementById('status').textContent=response.ok?'Authorized. You may close this tab.':'Authorization failed. Sign in to the Vault Host first.';};</script></body></html>`);
+    return context.html(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Authorize Prompt Vault CLI</title><style>body{font-family:system-ui;max-width:36rem;margin:4rem auto;padding:0 1rem}button{padding:.65rem 1rem}button+button{margin-left:.5rem}</style></head><body><main><h1>Authorize Prompt Vault CLI</h1><p>Application: <strong>${escapeHtml(device.label)}</strong></p><p>Code: <strong>${device.userCode}</strong></p><button id="approve">Approve</button><button id="deny">Deny</button><p id="status" role="status"></p></main><script nonce="${nonce}">const decide=async(action)=>{const response=await fetch('/api/v2/auth/device/'+action,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({userCode:'${device.userCode}'})});document.getElementById('status').textContent=response.ok?(action==='approve'?'Authorized. You may close this tab.':'Denied. You may close this tab.'):'Authorization failed. Sign in to the Vault Host first.';};document.getElementById('approve').onclick=()=>decide('approve');document.getElementById('deny').onclick=()=>decide('deny');</script></body></html>`);
   });
 
   app.post("/api/v2/auth/device", async (context) => {
@@ -293,19 +332,23 @@ export function createHttpApp({
     }), 201);
   });
 
-  app.get("/api/v2/auth/device/:requestId", async (context) => {
+  app.post("/api/v2/auth/device/token", async (context) => {
     if (!authorization) return context.json({ error: { code: "NOT_SUPPORTED", message: "CLI authorization is not configured" } }, 501);
     context.header("Cache-Control", "no-store");
-    const state = await authorization.pollDeviceRequest(context.req.param("requestId"));
+    const { deviceCode } = deviceTokenInputSchema.parse(await limitedJson(context.req.raw));
+    const state = await authorization.exchangeDeviceCode(deviceCode);
     if (!state) return context.json({ error: { code: "NOT_FOUND", message: "Authorization request not found" } }, 404);
     if (state.status === "pending") return context.json(state, 202);
+    if (state.status === "slow_down") return context.json(state, 429);
+    if (state.status === "denied") return context.json(state, 403);
     if (state.status === "expired") return context.json(state, 410);
     return context.json(state);
   });
 
-  app.delete("/api/v2/auth/device/:requestId", async (context) => {
+  app.delete("/api/v2/auth/device/token", async (context) => {
     if (!authorization) return context.json({ error: { code: "NOT_SUPPORTED", message: "CLI authorization is not configured" } }, 501);
-    await authorization.discardDeviceRequest(context.req.param("requestId"));
+    const { deviceCode } = deviceTokenInputSchema.parse(await limitedJson(context.req.raw));
+    await authorization.discardDeviceRequest(deviceCode);
     context.header("Cache-Control", "no-store");
     return context.body(null, 204);
   });
@@ -315,11 +358,18 @@ export function createHttpApp({
     return context.json(await authorization?.listPendingRequests() || []);
   });
 
-  app.post("/api/v2/auth/device/:requestId/approve", async (context) => {
+  app.post("/api/v2/auth/device/approve", async (context) => {
     if (context.get("identity")?.kind !== "host") return context.json({ error: { code: "FORBIDDEN", message: "Vault Host authorization is required" } }, 403);
     const body = deviceApprovalInputSchema.parse(await limitedJson(context.req.raw));
-    const approved = await authorization?.approveDeviceRequest(context.req.param("requestId"), body.userCode);
+    const approved = await authorization?.approveDeviceRequest(body.userCode);
     return approved ? context.body(null, 204) : context.json({ error: { code: "INVALID_REQUEST", message: "Authorization request or code is invalid" } }, 400);
+  });
+
+  app.post("/api/v2/auth/device/deny", async (context) => {
+    if (context.get("identity")?.kind !== "host") return context.json({ error: { code: "FORBIDDEN", message: "Vault Host authorization is required" } }, 403);
+    const body = deviceApprovalInputSchema.parse(await limitedJson(context.req.raw));
+    const denied = await authorization?.denyDeviceRequest(body.userCode);
+    return denied ? context.body(null, 204) : context.json({ error: { code: "INVALID_REQUEST", message: "Authorization request or code is invalid" } }, 400);
   });
 
   app.get("/api/v2/auth/session", (context) => context.json(context.get("identity")));
@@ -327,7 +377,7 @@ export function createHttpApp({
     const identity = context.get("identity");
     if (identity?.kind !== "cli") return context.json({ error: { code: "FORBIDDEN", message: "Only CLI credentials can revoke themselves" } }, 403);
     const authorizationHeader = context.req.header("Authorization") || "";
-    const supplied = authorizationHeader.startsWith("Bearer ") ? authorizationHeader.slice(7) : context.req.header("X-Vault-Token") || "";
+    const supplied = authorizationHeader.startsWith("Bearer ") ? authorizationHeader.slice(7) : "";
     await authorization?.revoke(supplied);
     return context.body(null, 204);
   });

@@ -8,8 +8,32 @@ import { createAuthorizationStore } from "../core/authorization.js";
 import { createPromptVault } from "../core/prompt-vault.js";
 import { copyLegacyWorkspace } from "../test/workspace.js";
 import { createHttpApp } from "./app.js";
+import { createBrowserSessionStore } from "./browser-sessions.js";
+import { createLocalLaunchAuthorization } from "./local-launch.js";
 
 const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64");
+
+async function signInBrowser(app: ReturnType<typeof createHttpApp>, origin: string, token = "host-token") {
+  const response = await app.request(`${origin}/api/v2/auth/browser`, {
+    method: "POST",
+    headers: { Origin: origin, "Sec-Fetch-Site": "same-origin", "Content-Type": "application/json" },
+    body: JSON.stringify({ token }),
+  });
+  expect(response.status).toBe(204);
+  return (response.headers.get("set-cookie") || "").split(";")[0];
+}
+
+async function browserHeaders(app: ReturnType<typeof createHttpApp>, origin = "http://localhost") {
+  return {
+    Cookie: await signInBrowser(app, origin),
+    Origin: origin,
+    "Sec-Fetch-Site": "same-origin",
+  };
+}
+
+async function browserJsonHeaders(app: ReturnType<typeof createHttpApp>, origin = "http://localhost") {
+  return { ...await browserHeaders(app, origin), "Content-Type": "application/json" };
+}
 
 describe("Prompt Vault HTTP adapter", () => {
   it("exposes an unauthenticated health check", async () => {
@@ -59,36 +83,92 @@ describe("Prompt Vault HTTP adapter", () => {
   });
 
   it("exchanges the host token for an HTTP-only browser session", async () => {
-    const vault = createPromptVault({ workspace: await mkdtemp(join(tmpdir(), "prompt-vault-http-browser-auth-")) });
-    const app = createHttpApp({ vault, token: "host-token", publicOrigin: "https://vault.test" });
+    const directory = await mkdtemp(join(tmpdir(), "prompt-vault-http-browser-auth-"));
+    const vault = createPromptVault({ workspace: join(directory, "workspace") });
+    const sessions = createBrowserSessionStore({ directory: join(directory, "sessions") });
+    const app = createHttpApp({ vault, token: "host-token", browserSessions: sessions, publicOrigin: "https://vault.test" });
+
+    const crossOrigin = await app.request("https://vault.test/api/v2/auth/browser", {
+      method: "POST",
+      headers: { Origin: "https://attacker.test", "Sec-Fetch-Site": "cross-site", "Content-Type": "application/json" },
+      body: JSON.stringify({ token: "host-token" }),
+    });
+    expect(crossOrigin.status).toBe(403);
 
     const rejected = await app.request("https://vault.test/api/v2/auth/browser", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { Origin: "https://vault.test", "Sec-Fetch-Site": "same-origin", "Content-Type": "application/json" },
       body: JSON.stringify({ token: "wrong-token" }),
     });
     expect(rejected.status).toBe(401);
 
     const signedIn = await app.request("https://vault.test/api/v2/auth/browser", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { Origin: "https://vault.test", "Sec-Fetch-Site": "same-origin", "Content-Type": "application/json" },
       body: JSON.stringify({ token: "host-token" }),
     });
     expect(signedIn.status).toBe(204);
     const cookie = signedIn.headers.get("set-cookie") || "";
-    expect(cookie).toContain("prompt_vault_token=host-token");
+    expect(cookie).toContain("prompt_vault_session=pvs_");
+    expect(cookie).not.toContain("host-token");
     expect(cookie).toContain("HttpOnly");
     expect(cookie).toContain("SameSite=Strict");
     expect(cookie).toContain("Secure");
+    expect(cookie).toContain("Max-Age=");
 
-    const session = await app.request("https://vault.test/api/v2/auth/session", {
+    const restarted = createHttpApp({ vault, token: "host-token", browserSessions: createBrowserSessionStore({ directory: join(directory, "sessions") }), publicOrigin: "https://vault.test" });
+    const session = await restarted.request("https://vault.test/api/v2/auth/session", {
       headers: { Cookie: cookie.split(";")[0] },
     });
     expect(session.status).toBe(200);
     expect(await session.json()).toEqual({ kind: "host", label: "Vault Host" });
+
+    const loggedOut = await restarted.request("https://vault.test/api/v2/auth/browser", {
+      method: "DELETE",
+      headers: { Cookie: cookie.split(";")[0], Origin: "https://vault.test" },
+    });
+    expect(loggedOut.status).toBe(204);
+    expect((await restarted.request("https://vault.test/api/v2/auth/session", { headers: { Cookie: cookie.split(";")[0] } })).status).toBe(401);
   });
 
-  it("serves the read contract and enforces the current host token", async () => {
+  it("exchanges a short-lived local launch nonce for one browser session", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "prompt-vault-http-launch-"));
+    const launch = createLocalLaunchAuthorization({ origin: "http://127.0.0.1:8767", instanceId: "instance-one" });
+    const app = createHttpApp({
+      vault: createPromptVault({ workspace: join(directory, "workspace") }),
+      token: "host-token",
+      browserSessions: createBrowserSessionStore({ directory: join(directory, "sessions") }),
+      localLaunch: launch.authorization,
+      publicOrigin: "http://127.0.0.1:8767",
+      instanceId: "instance-one",
+    });
+
+    const crossOrigin = await app.request("http://127.0.0.1:8767/api/v2/auth/launch", {
+      method: "POST",
+      headers: { Origin: "http://attacker.test", "Content-Type": "application/json" },
+      body: JSON.stringify({ nonce: launch.nonce }),
+    });
+    expect(crossOrigin.status).toBe(403);
+
+    const claimed = await app.request("http://127.0.0.1:8767/api/v2/auth/launch", {
+      method: "POST",
+      headers: { Origin: "http://127.0.0.1:8767", "Content-Type": "application/json" },
+      body: JSON.stringify({ nonce: launch.nonce }),
+    });
+    expect(claimed.status).toBe(204);
+    const cookie = (claimed.headers.get("set-cookie") || "").split(";")[0];
+    expect(cookie).toMatch(/^prompt_vault_session=pvs_/);
+    expect((await app.request("http://127.0.0.1:8767/api/v2/auth/session", { headers: { Cookie: cookie } })).status).toBe(200);
+
+    const repeated = await app.request("http://127.0.0.1:8767/api/v2/auth/launch", {
+      method: "POST",
+      headers: { Origin: "http://127.0.0.1:8767", "Content-Type": "application/json" },
+      body: JSON.stringify({ nonce: launch.nonce }),
+    });
+    expect(repeated.status).toBe(401);
+  });
+
+  it("serves the read contract through browser sessions and rejects the recovery token as a bearer", async () => {
     const vault = createPromptVault({ workspace: await copyLegacyWorkspace() });
     const app = createHttpApp({ vault, token: "host-token" });
 
@@ -97,25 +177,30 @@ describe("Prompt Vault HTTP adapter", () => {
     const response = await app.request("/api/v2/themes/legacy-fixture", {
       headers: { Authorization: "Bearer host-token" },
     });
-    expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({
+    expect(response.status).toBe(401);
+
+    const browserCookie = await signInBrowser(app, "http://localhost");
+    const browserResponse = await app.request("/api/v2/themes/legacy-fixture", {
+      headers: { Cookie: browserCookie },
+    });
+    expect(browserResponse.status).toBe(200);
+    expect(await browserResponse.json()).toMatchObject({
       slug: "legacy-fixture",
       baseRevision: 1,
       revisionCount: 1,
       draft: { prompt: "first prompt" },
     });
 
-    const listResponse = await app.request("/api/v2/themes", {
+    const legacyHeader = await app.request("/api/v2/themes", {
       headers: { "X-Vault-Token": "host-token" },
     });
-    expect(listResponse.status).toBe(200);
-    expect(await listResponse.json()).toMatchObject([{ slug: "legacy-fixture" }]);
+    expect(legacyHeader.status).toBe(401);
   });
 
   it("includes every revision image in the Theme summary for node carousels", async () => {
     const vault = createPromptVault({ workspace: await mkdtemp(join(tmpdir(), "prompt-vault-http-carousel-")) });
     const app = createHttpApp({ vault, token: "host-token" });
-    const headers = { Authorization: "Bearer host-token", "Content-Type": "application/json" };
+    const headers = await browserJsonHeaders(app);
     const created = await app.request("/api/v2/themes", {
       method: "POST",
       headers,
@@ -128,7 +213,7 @@ describe("Prompt Vault HTTP adapter", () => {
     form.append("files", new Blob([png], { type: "image/png" }), "second.png");
     await app.request(`/api/v2/themes/${theme.slug}/assets`, {
       method: "POST",
-      headers: { Authorization: "Bearer host-token" },
+      headers: await browserHeaders(app),
       body: form,
     });
 
@@ -156,7 +241,7 @@ describe("Prompt Vault HTTP adapter", () => {
   it("stores mutable node titles outside immutable Revision history", async () => {
     const vault = createPromptVault({ workspace: await mkdtemp(join(tmpdir(), "prompt-vault-http-node-title-")) });
     const app = createHttpApp({ vault, token: "host-token" });
-    const headers = { Authorization: "Bearer host-token", "Content-Type": "application/json" };
+    const headers = await browserJsonHeaders(app);
     const created = await app.request("/api/v2/themes", { method: "POST", headers, body: JSON.stringify({ title: "Titles", prompt: "draft" }) });
     const theme = await created.json() as { slug: string };
     const working = await app.request(`/api/v2/themes/${theme.slug}/nodes/working/title`, { method: "PATCH", headers, body: JSON.stringify({ title: "Working name" }) });
@@ -171,7 +256,7 @@ describe("Prompt Vault HTTP adapter", () => {
   it("creates and edits Drafts and manages Assets through the authenticated contract", async () => {
     const vault = createPromptVault({ workspace: await mkdtemp(join(tmpdir(), "prompt-vault-http-draft-")) });
     const app = createHttpApp({ vault, token: "host-token" });
-    const headers = { Authorization: "Bearer host-token", "Content-Type": "application/json" };
+    const headers = await browserJsonHeaders(app);
 
     const created = await app.request("/api/v2/themes", {
       method: "POST",
@@ -200,18 +285,19 @@ describe("Prompt Vault HTTP adapter", () => {
     form.append("files", new Blob([png], { type: "image/png" }), "a-result.png");
     const uploaded = await app.request(`/api/v2/themes/${theme.slug}/assets`, {
       method: "POST",
-      headers: { Authorization: "Bearer host-token" },
+      headers: await browserHeaders(app),
       body: form,
     });
     expect(uploaded.status).toBe(201);
     expect(await uploaded.json()).toMatchObject({ draft: { assets: { result: [{ name: "z-result.png" }, { name: "a-result.png" }] } } });
     const currentAsset = await app.request(`/api/v2/themes/${theme.slug}/assets/result/z-result.png`, {
-      headers: { Authorization: "Bearer host-token" },
+      headers: await browserHeaders(app),
     });
     expect(currentAsset.headers.get("content-type")).toBe("image/png");
     expect(Buffer.from(await currentAsset.arrayBuffer())).toEqual(png);
+    const browserCookie = await signInBrowser(app, "http://localhost");
     const cookieAsset = await app.request(`/api/v2/themes/${theme.slug}/assets/result/z-result.png`, {
-      headers: { Cookie: "prompt_vault_token=host-token" },
+      headers: { Cookie: browserCookie },
     });
     expect(cookieAsset.status).toBe(200);
     expect(Buffer.from(await cookieAsset.arrayBuffer())).toEqual(png);
@@ -226,14 +312,14 @@ describe("Prompt Vault HTTP adapter", () => {
 
     const removed = await app.request(`/api/v2/themes/${theme.slug}/assets/result/a-result.png`, {
       method: "DELETE",
-      headers: { Authorization: "Bearer host-token" },
+      headers: await browserHeaders(app),
     });
     expect(removed.status).toBe(200);
     expect(await removed.json()).toMatchObject({ draft: { assets: { result: [{ name: "z-result.png" }] } } });
 
     const discarded = await app.request(`/api/v2/themes/${theme.slug}/draft/discard`, {
       method: "POST",
-      headers: { Authorization: "Bearer host-token" },
+      headers: await browserHeaders(app),
     });
     expect(discarded.status).toBe(200);
     expect(await discarded.json()).toMatchObject({ hasUnsavedChanges: false, revisionCount: 0, draft: { prompt: "", notes: "" } });
@@ -242,7 +328,7 @@ describe("Prompt Vault HTTP adapter", () => {
   it("rejects invalid Draft mutation bodies without changing the Theme", async () => {
     const vault = createPromptVault({ workspace: await mkdtemp(join(tmpdir(), "prompt-vault-http-invalid-")) });
     const app = createHttpApp({ vault, token: "host-token" });
-    const headers = { Authorization: "Bearer host-token", "Content-Type": "application/json" };
+    const headers = await browserJsonHeaders(app);
 
     const invalidCreate = await app.request("/api/v2/themes", {
       method: "POST",
@@ -279,29 +365,35 @@ describe("Prompt Vault HTTP adapter", () => {
     const app = createHttpApp({ vault, token: "host-token", publicOrigin: "http://vault.test" });
     const created = await app.request("http://vault.test/api/v2/themes", {
       method: "POST",
-      headers: { Authorization: "Bearer host-token", "Content-Type": "application/json" },
+      headers: await browserJsonHeaders(app, "http://vault.test"),
       body: JSON.stringify({ title: "CSRF", prompt: "dirty" }),
     });
     const theme = await created.json() as { slug: string };
+    const browserCookie = await signInBrowser(app, "http://vault.test");
 
     const rejected = await app.request(`http://vault.test/api/v2/themes/${theme.slug}/draft/discard`, {
       method: "POST",
-      headers: { Cookie: "prompt_vault_token=host-token", Origin: "http://attacker.test" },
+      headers: { Cookie: browserCookie, Origin: "http://attacker.test", "Sec-Fetch-Site": "cross-site" },
     });
     expect(rejected.status).toBe(403);
     expect((await vault.getTheme(theme.slug)).hasUnsavedChanges).toBe(true);
+    const misleadingOrigin = await app.request(`http://vault.test/api/v2/themes/${theme.slug}/draft/discard`, {
+      method: "POST",
+      headers: { Cookie: browserCookie, Origin: "http://vault.test", "Sec-Fetch-Site": "cross-site" },
+    });
+    expect(misleadingOrigin.status).toBe(403);
     const accepted = await app.request(`http://vault.test/api/v2/themes/${theme.slug}/draft/discard`, {
       method: "POST",
-      headers: { Cookie: "prompt_vault_token=host-token", Origin: "http://vault.test" },
+      headers: { Cookie: browserCookie, Origin: "http://vault.test", "Sec-Fetch-Site": "same-origin" },
     });
     expect(accepted.status).toBe(200);
-    expect(accepted.headers.get("set-cookie")).toContain("HttpOnly");
+    expect(accepted.headers.get("set-cookie")).toBeNull();
   });
 
   it("saves, inspects, continues, restores, and compares Revision Lineage", async () => {
     const vault = createPromptVault({ workspace: await mkdtemp(join(tmpdir(), "prompt-vault-http-revision-")) });
     const app = createHttpApp({ vault, token: "host-token" });
-    const headers = { Authorization: "Bearer host-token", "Content-Type": "application/json" };
+    const headers = await browserJsonHeaders(app);
     const createResponse = await app.request("/api/v2/themes", {
       method: "POST",
       headers,
@@ -313,7 +405,7 @@ describe("Prompt Vault HTTP adapter", () => {
     assetForm.append("files", new Blob([png], { type: "image/png" }), "source.png");
     expect((await app.request(`/api/v2/themes/${theme.slug}/assets`, {
       method: "POST",
-      headers: { Authorization: "Bearer host-token" },
+      headers: await browserHeaders(app),
       body: assetForm,
     })).status).toBe(201);
 
@@ -373,7 +465,7 @@ describe("Prompt Vault HTTP adapter", () => {
   it("applies browser editor changes as one host-side transaction", async () => {
     const vault = createPromptVault({ workspace: await mkdtemp(join(tmpdir(), "prompt-vault-http-editor-")) });
     const app = createHttpApp({ vault, token: "host-token" });
-    const headers = { Authorization: "Bearer host-token", "Content-Type": "application/json" };
+    const headers = await browserJsonHeaders(app);
     const created = await app.request("/api/v2/themes", { method: "POST", headers, body: JSON.stringify({ title: "Editor", prompt: "root" }) });
     const theme = await created.json() as { slug: string };
     await app.request(`/api/v2/themes/${theme.slug}/revisions`, { method: "POST", headers, body: JSON.stringify({ note: "Root" }) });
@@ -383,7 +475,7 @@ describe("Prompt Vault HTTP adapter", () => {
     invalidForm.append("result_files", new Blob(["not an image"]), "broken.png");
     const invalid = await app.request(`/api/v2/themes/${theme.slug}/draft/apply`, {
       method: "POST",
-      headers: { Authorization: "Bearer host-token" },
+      headers: await browserHeaders(app),
       body: invalidForm,
     });
     expect(invalid.status).toBe(400);
@@ -399,7 +491,7 @@ describe("Prompt Vault HTTP adapter", () => {
     form.append("result_files", new Blob([png], { type: "image/png" }), "child.png");
     const saved = await app.request(`/api/v2/themes/${theme.slug}/draft/apply`, {
       method: "POST",
-      headers: { Authorization: "Bearer host-token" },
+      headers: await browserHeaders(app),
       body: form,
     });
     expect(saved.status).toBe(200);
@@ -409,7 +501,7 @@ describe("Prompt Vault HTTP adapter", () => {
   it("saves the editable working-node title with the rest of its modal fields", async () => {
     const vault = createPromptVault({ workspace: await mkdtemp(join(tmpdir(), "prompt-vault-http-working-title-")) });
     const app = createHttpApp({ vault, token: "host-token" });
-    const headers = { Authorization: "Bearer host-token", "Content-Type": "application/json" };
+    const headers = await browserJsonHeaders(app);
     const created = await app.request("/api/v2/themes", {
       method: "POST",
       headers,
@@ -421,7 +513,7 @@ describe("Prompt Vault HTTP adapter", () => {
 
     const saved = await app.request(`/api/v2/themes/${theme.slug}/draft/apply`, {
       method: "POST",
-      headers: { Authorization: "Bearer host-token" },
+      headers: await browserHeaders(app),
       body: form,
     });
 
@@ -432,7 +524,7 @@ describe("Prompt Vault HTTP adapter", () => {
   it("overwrites the displayed node without creating a Draft node or a new child", async () => {
     const vault = createPromptVault({ workspace: await mkdtemp(join(tmpdir(), "prompt-vault-http-overwrite-")) });
     const app = createHttpApp({ vault, token: "host-token" });
-    const headers = { Authorization: "Bearer host-token", "Content-Type": "application/json" };
+    const headers = await browserJsonHeaders(app);
     const created = await app.request("/api/v2/themes", {
       method: "POST",
       headers,
@@ -454,7 +546,7 @@ describe("Prompt Vault HTTP adapter", () => {
     form.append("result_files", new Blob([png], { type: "image/png" }), "updated.png");
     const overwritten = await app.request(`/api/v2/themes/${theme.slug}/revisions/1`, {
       method: "PUT",
-      headers: { Authorization: "Bearer host-token" },
+      headers: await browserHeaders(app),
       body: form,
     });
 
@@ -476,7 +568,7 @@ describe("Prompt Vault HTTP adapter", () => {
   it("exposes management operations and their safety rules", async () => {
     const vault = createPromptVault({ workspace: await mkdtemp(join(tmpdir(), "prompt-vault-http-management-")) });
     const app = createHttpApp({ vault, token: "host-token" });
-    const headers = { Authorization: "Bearer host-token", "Content-Type": "application/json" };
+    const headers = await browserJsonHeaders(app);
     const created = await app.request("/api/v2/themes", {
       method: "POST",
       headers,
@@ -513,7 +605,7 @@ describe("Prompt Vault HTTP adapter", () => {
     const directory = await mkdtemp(join(tmpdir(), "prompt-vault-auth-"));
     const vault = createPromptVault({ workspace: await copyLegacyWorkspace() });
     const credentialDirectory = join(directory, "credentials");
-    const authorization = await createAuthorizationStore({ credentialDirectory });
+    const authorization = await createAuthorizationStore({ credentialDirectory, pollIntervalMs: 0 });
     const app = createHttpApp({ vault, token: "host-token", authorization, publicOrigin: "http://vault.test" });
 
     const created = await app.request("http://vault.test/api/v2/auth/device", {
@@ -522,9 +614,10 @@ describe("Prompt Vault HTTP adapter", () => {
       body: JSON.stringify({ label: "Test CLI" }),
     });
     expect(created.status).toBe(201);
-    const request = await created.json() as { requestId: string; userCode: string; verificationUri: string };
-    expect(request).toMatchObject({ userCode: expect.stringMatching(/^[A-Z0-9]{8}$/) });
-    expect(request.verificationUri).toContain(`/auth/cli/${request.requestId}`);
+    const request = await created.json() as { deviceCode: string; userCode: string; verificationUri: string };
+    expect(request).toMatchObject({ deviceCode: expect.stringMatching(/^[A-Za-z0-9_-]{43}$/), userCode: expect.stringMatching(/^[A-Z0-9]{8}$/) });
+    expect(request.verificationUri).toBe(`http://vault.test/auth/cli?code=${request.userCode}`);
+    expect(request.verificationUri).not.toContain(request.deviceCode);
     const approvalPage = await app.request(request.verificationUri);
     expect(approvalPage.status).toBe(200);
     expect(approvalPage.headers.get("x-frame-options")).toBe("DENY");
@@ -535,36 +628,44 @@ describe("Prompt Vault HTTP adapter", () => {
     expect(approvalHtml).not.toContain("localStorage");
     expect(approvalHtml).not.toContain("X-Vault-Token");
 
-    expect((await app.request(`/api/v2/auth/device/${request.requestId}`)).status).toBe(202);
-    expect((await app.request(`/api/v2/auth/device/${request.requestId}/approve`, {
+    expect((await app.request("/api/v2/auth/device/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ deviceCode: request.deviceCode }),
+    })).status).toBe(202);
+    expect((await app.request("/api/v2/auth/device/approve", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ userCode: request.userCode }),
     })).status).toBe(401);
 
-    const browserLogin = await app.request("http://vault.test/api/v2/auth/browser", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ token: "host-token" }),
-    });
-    const browserCookie = (browserLogin.headers.get("set-cookie") || "").split(";")[0];
-    const approvals = await Promise.all([1, 2].map(() => app.request(`/api/v2/auth/device/${request.requestId}/approve`, {
+    const browserCookie = await signInBrowser(app, "http://vault.test");
+    const approvals = await Promise.all([1, 2].map(() => app.request("/api/v2/auth/device/approve", {
       method: "POST",
       headers: { Cookie: browserCookie, Origin: "http://vault.test", "Content-Type": "application/json" },
       body: JSON.stringify({ userCode: request.userCode }),
     })));
     expect(approvals.map((response) => response.status).sort()).toEqual([204, 400]);
+    const beforeExchange = await app.request("/api/v2/auth/credentials", {
+      headers: { Cookie: browserCookie },
+    });
+    expect(await beforeExchange.json()).toEqual([]);
 
-    const completed = await app.request(`/api/v2/auth/device/${request.requestId}`);
+    const completed = await app.request("/api/v2/auth/device/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ deviceCode: request.deviceCode }),
+    });
     expect(completed.status).toBe(200);
     const credential = await completed.json() as { status: string; token: string };
     expect(credential).toMatchObject({ status: "approved", token: expect.stringMatching(/^pv_/) });
     expect(completed.headers.get("cache-control")).toBe("no-store");
-    const repeated = await app.request(`/api/v2/auth/device/${request.requestId}`);
-    expect(repeated.status).toBe(200);
-    expect(await repeated.json()).toEqual(credential);
-    expect((await app.request(`/api/v2/auth/device/${request.requestId}`, { method: "DELETE" })).status).toBe(204);
-    expect((await app.request(`/api/v2/auth/device/${request.requestId}`)).status).toBe(404);
+    const repeated = await app.request("/api/v2/auth/device/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ deviceCode: request.deviceCode }),
+    });
+    expect(repeated.status).toBe(404);
 
     const themes = await app.request("/api/v2/themes", { headers: { Authorization: `Bearer ${credential.token}` } });
     expect(themes.status).toBe(200);
@@ -575,7 +676,7 @@ describe("Prompt Vault HTTP adapter", () => {
 
     expect((await app.request("/api/v2/auth/session", {
       method: "DELETE",
-      headers: { "X-Vault-Token": credential.token },
+      headers: { Authorization: `Bearer ${credential.token}` },
     })).status).toBe(204);
     expect((await app.request("/api/v2/themes", { headers: { Authorization: `Bearer ${credential.token}` } })).status).toBe(401);
 
@@ -595,13 +696,47 @@ describe("Prompt Vault HTTP adapter", () => {
       authorization,
     });
     const created = await app.request("http://vault.test/api/v2/auth/device", { method: "POST" });
-    const request = await created.json() as { requestId: string; expiresIn: number };
+    const request = await created.json() as { deviceCode: string; expiresIn: number };
     now += request.expiresIn * 1_000 + 1;
 
-    const expired = await app.request(`/api/v2/auth/device/${request.requestId}`);
+    const expired = await app.request("/api/v2/auth/device/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ deviceCode: request.deviceCode }),
+    });
 
     expect(expired.status).toBe(410);
     expect(await expired.json()).toEqual({ status: "expired" });
+  });
+
+  it("throttles device polling and atomically consumes denial", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "prompt-vault-auth-denial-"));
+    let now = Date.now();
+    const authorization = await createAuthorizationStore({
+      credentialDirectory: join(directory, "credentials"),
+      now: () => now,
+      pollIntervalMs: 1_000,
+    });
+    const app = createHttpApp({ vault: createPromptVault({ workspace: await copyLegacyWorkspace() }), token: "host-token", authorization });
+    const browserCookie = await signInBrowser(app, "http://localhost");
+    const created = await app.request("http://vault.test/api/v2/auth/device", { method: "POST" });
+    const request = await created.json() as { deviceCode: string; userCode: string };
+    const exchange = () => app.request("/api/v2/auth/device/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ deviceCode: request.deviceCode }),
+    });
+
+    expect((await exchange()).status).toBe(202);
+    expect((await exchange()).status).toBe(429);
+    expect((await app.request("/api/v2/auth/device/deny", {
+      method: "POST",
+      headers: { Cookie: browserCookie, Origin: "http://localhost", "Sec-Fetch-Site": "same-origin", "Content-Type": "application/json" },
+      body: JSON.stringify({ userCode: request.userCode }),
+    })).status).toBe(204);
+    now += 1_001;
+    expect((await exchange()).status).toBe(403);
+    expect((await exchange()).status).toBe(404);
   });
 
   it("limits unauthenticated pending CLI authorization requests", async () => {
@@ -627,16 +762,21 @@ describe("Prompt Vault HTTP adapter", () => {
 
   it("does not count delivered CLI credentials against pending authorization capacity", async () => {
     const directory = await mkdtemp(join(tmpdir(), "prompt-vault-auth-capacity-"));
-    const authorization = await createAuthorizationStore({ credentialDirectory: join(directory, "credentials"), maxPending: 1 });
+    const authorization = await createAuthorizationStore({ credentialDirectory: join(directory, "credentials"), maxPending: 1, pollIntervalMs: 0 });
     const app = createHttpApp({ vault: createPromptVault({ workspace: await copyLegacyWorkspace() }), token: "host-token", authorization });
+    const browserCookie = await signInBrowser(app, "http://localhost");
     const first = await app.request("http://vault.test/api/v2/auth/device", { method: "POST" });
-    const request = await first.json() as { requestId: string; userCode: string };
-    expect((await app.request(`/api/v2/auth/device/${request.requestId}/approve`, {
+    const request = await first.json() as { deviceCode: string; userCode: string };
+    expect((await app.request("/api/v2/auth/device/approve", {
       method: "POST",
-      headers: { Authorization: "Bearer host-token", "Content-Type": "application/json" },
+      headers: { Cookie: browserCookie, Origin: "http://localhost", "Sec-Fetch-Site": "same-origin", "Content-Type": "application/json" },
       body: JSON.stringify({ userCode: request.userCode }),
     })).status).toBe(204);
-    expect((await app.request(`/api/v2/auth/device/${request.requestId}`)).status).toBe(200);
+    expect((await app.request("/api/v2/auth/device/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ deviceCode: request.deviceCode }),
+    })).status).toBe(200);
 
     expect((await app.request("http://vault.test/api/v2/auth/device", { method: "POST" })).status).toBe(201);
   });
@@ -682,9 +822,7 @@ describe("Prompt Vault HTTP adapter", () => {
       token: "host-token",
     });
 
-    const response = await app.request("/api/v2/not-supported", {
-      headers: { Authorization: "Bearer host-token" },
-    });
+    const response = await app.request("/api/v2/not-supported", { headers: await browserHeaders(app) });
 
     expect(response.status).toBe(404);
     expect(response.headers.get("content-type")).toContain("application/json");

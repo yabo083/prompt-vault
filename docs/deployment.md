@@ -2,7 +2,7 @@
 
 ## Docker Compose
 
-The published image is `ghcr.io/yabo083/prompt-vault`. The included `compose.yaml` uses a named volume for `/data` and publishes port `8767`.
+The published image is `ghcr.io/yabo083/prompt-vault`. It installs the same tested npm tarball used by local deployments. The included `compose.yaml` uses a named volume for `/data` and publishes port `8767`.
 
 ```bash
 curl -LO https://raw.githubusercontent.com/yabo083/prompt-vault/main/compose.yaml
@@ -17,6 +17,7 @@ The first start creates:
 - `/data/workspace`: Themes, Drafts, Revisions, and Assets
 - `/data/.vault-token`: generated Host Token
 - `/data/.vault-auth`: revocable CLI credentials
+- `/data/.browser-sessions`: independent browser sessions
 
 Check health and logs with:
 
@@ -61,7 +62,7 @@ docker compose up -d
 docker compose exec prompt-vault cat /data/.vault-token
 ```
 
-Existing browser cookies stop authenticating after rotation. CLI credentials remain independently valid; each client can revoke its own credential with `prompt-vault auth logout`, and host administrators can use the authenticated credential API for central revocation.
+Browser sessions and CLI credentials are independent from the Host Token and remain valid after token rotation. To force browser reauthentication, stop the Host and remove `/data/.browser-sessions` before restarting. Each CLI can revoke its own credential with `prompt-vault auth logout`, and Host administrators can use the authenticated credential API for central revocation.
 
 ## HTTPS And Public Origin
 
@@ -102,6 +103,18 @@ PROMPT_VAULT_CREDENTIAL_DIRECTORY=/var/lib/prompt-vault/.vault-auth \
 PROMPT_VAULT_STATIC_DIRECTORY="$PWD/static/dist" \
 node dist/server/index.js
 ```
+
+To build the container from source, first create the canonical tarball that the image installs:
+
+```bash
+mkdir -p artifacts
+npm pack --workspace @miyako-lab/prompt-vault-cli --pack-destination artifacts
+mv artifacts/*.tgz artifacts/prompt-vault.tgz
+node scripts/smoke-cli-package.mjs --tarball artifacts/prompt-vault.tgz
+docker build -t prompt-vault:local .
+```
+
+The Dockerfile intentionally does not rebuild application source. CI and releases pass the same smoke-tested `artifacts/prompt-vault.tgz` to npm publication and the image build.
 
 ## systemd
 

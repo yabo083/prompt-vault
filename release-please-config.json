@@ -18,6 +18,16 @@
           "type": "json",
           "path": "package-lock.json",
           "jsonpath": "$['packages']['packages/cli']['version']"
+        },
+        {
+          "type": "json",
+          "path": "packages/cli/npm-shrinkwrap.json",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "json",
+          "path": "packages/cli/npm-shrinkwrap.json",
+          "jsonpath": "$['packages']['']['version']"
         }
       ]
     }

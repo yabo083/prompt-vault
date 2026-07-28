@@ -5,13 +5,20 @@ import { dirname, join } from "node:path";
 import lockfile from "proper-lockfile";
 import { z } from "zod";
 
+const hostSchema = z.object({
+  url: z.string().url(),
+  allowInsecureHttp: z.boolean(),
+  ownership: z.enum(["managed-local", "external"]),
+});
+
 const configSchema = z.object({
-  currentHost: z.string().nullable().default(null),
-  hosts: z.record(z.string(), z.object({ url: z.string().url() })).default({}),
+  currentHost: z.string().nullable(),
+  localInstance: z.string().nullable(),
+  hosts: z.record(z.string(), hostSchema),
 });
 
 const fileCredentialsSchema = z.object({
-  tokens: z.record(z.string(), z.string()).default({}),
+  tokens: z.record(z.string(), z.string()),
 });
 
 type CliConfig = z.infer<typeof configSchema>;
@@ -86,50 +93,103 @@ async function readFileCredentials(path: string) {
   return readJson(path, fileCredentialsSchema, { tokens: {} });
 }
 
+async function keyringEntry(directory: string, name: string) {
+  if (useFileCredentialStore()) return null;
+  try {
+    const { Entry } = await import("@napi-rs/keyring");
+    return new Entry(keyringService(directory), name);
+  } catch {
+    return null;
+  }
+}
+
 async function getToken(name: string) {
   const files = paths();
-  if (useFileCredentialStore()) return (await readFileCredentials(files.credentials)).tokens[name];
-  const { Entry } = await import("@napi-rs/keyring");
-  return new Entry(keyringService(files.directory), name).getPassword() || undefined;
+  const fileToken = (await readFileCredentials(files.credentials)).tokens[name];
+  if (fileToken) return fileToken;
+  const entry = await keyringEntry(files.directory, name);
+  if (!entry) return undefined;
+  try {
+    return entry.getPassword() || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 async function setToken(name: string, token: string) {
   const files = paths();
-  if (useFileCredentialStore()) {
-    const credentials = await readFileCredentials(files.credentials);
-    await atomicJson(files.credentials, { tokens: { ...credentials.tokens, [name]: token } }, 0o600);
-    return;
+  const entry = await keyringEntry(files.directory, name);
+  if (entry) {
+    try {
+      entry.setPassword(token);
+      const credentials = await readFileCredentials(files.credentials);
+      if (credentials.tokens[name]) {
+        const tokens = { ...credentials.tokens };
+        delete tokens[name];
+        await atomicJson(files.credentials, { tokens }, 0o600);
+      }
+      return;
+    } catch {
+      // Fall back to the protected file store when the platform service is unavailable.
+    }
   }
-  const { Entry } = await import("@napi-rs/keyring");
-  new Entry(keyringService(files.directory), name).setPassword(token);
+  const credentials = await readFileCredentials(files.credentials);
+  await atomicJson(files.credentials, { tokens: { ...credentials.tokens, [name]: token } }, 0o600);
 }
 
 async function deleteToken(name: string) {
   const files = paths();
-  if (useFileCredentialStore()) {
-    const credentials = await readFileCredentials(files.credentials);
-    const tokens = { ...credentials.tokens };
-    delete tokens[name];
-    await atomicJson(files.credentials, { tokens }, 0o600);
-    return;
+  const entry = await keyringEntry(files.directory, name);
+  if (entry) {
+    try {
+      entry.deletePassword();
+    } catch {
+      // Continue so a file-fallback credential is still removed.
+    }
   }
-  const { Entry } = await import("@napi-rs/keyring");
-  new Entry(keyringService(files.directory), name).deletePassword();
+  const credentials = await readFileCredentials(files.credentials);
+  const tokens = { ...credentials.tokens };
+  delete tokens[name];
+  await atomicJson(files.credentials, { tokens }, 0o600);
 }
 
 async function loadConfig() {
   const files = paths();
-  return { files, config: await readJson(files.config, configSchema, { currentHost: null, hosts: {} }) };
+  return { files, config: await readJson(files.config, configSchema, { currentHost: null, localInstance: null, hosts: {} }) };
 }
 
-export async function saveLogin(nameValue: string, url: string, token: string) {
+export async function setDefaultLocalInstance(directory: string) {
+  return withConfigLock(async () => {
+    const { files, config } = await loadConfig();
+    await atomicJson(files.config, { ...config, localInstance: directory });
+    return directory;
+  });
+}
+
+export async function getDefaultLocalInstance() {
+  return (await loadConfig()).config.localInstance;
+}
+
+export async function saveLogin(nameValue: string, url: string, token: string, {
+  select = true,
+  allowInsecureHttp = false,
+  ownership = "external",
+}: {
+  select?: boolean;
+  allowInsecureHttp?: boolean;
+  ownership?: "managed-local" | "external";
+} = {}) {
   const name = validateHostName(nameValue);
   return withConfigLock(async () => {
     const { files, config } = await loadConfig();
     const normalized = normalizeHostUrl(url);
     const previousToken = await getToken(name);
     await setToken(name, token);
-    const nextConfig: CliConfig = { currentHost: name, hosts: { ...config.hosts, [name]: { url: normalized } } };
+    const nextConfig: CliConfig = {
+      ...config,
+      currentHost: select ? name : config.currentHost,
+      hosts: { ...config.hosts, [name]: { url: normalized, allowInsecureHttp, ownership } },
+    };
     try {
       await atomicJson(files.config, nextConfig);
     } catch (error) {
@@ -155,11 +215,18 @@ export async function resolveConnection(selector?: string) {
   if (selector && /^https?:\/\//i.test(selector)) {
     const url = normalizeHostUrl(selector);
     const configured = Object.entries(config.hosts).find(([, host]) => host.url === url)?.[0];
-    return { name: configured || url, url, token: configured ? await getToken(configured) : undefined };
+    const host = configured ? config.hosts[configured] : null;
+    return {
+      name: configured || url,
+      url,
+      token: configured ? await getToken(configured) : undefined,
+      allowInsecureHttp: host?.allowInsecureHttp || false,
+      ownership: host?.ownership || ("external" as const),
+    };
   }
   const name = selector || config.currentHost;
   if (!name || !config.hosts[name]) return null;
-  return { name, url: config.hosts[name].url, token: await getToken(name) };
+  return { name, ...config.hosts[name], token: await getToken(name) };
 }
 
 export async function listHosts() {
@@ -169,6 +236,8 @@ export async function listHosts() {
     url: host.url,
     current: config.currentHost === name,
     authenticated: Boolean(await getToken(name)),
+    ownership: host.ownership,
+    allowInsecureHttp: host.allowInsecureHttp,
   })));
   return hosts.sort((left, right) => left.name.localeCompare(right.name));
 }

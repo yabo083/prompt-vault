@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       container-version:
-        description: Existing release version to publish to GHCR only
+        description: Current source release version to republish to GHCR only
         required: false
         type: string
 
@@ -36,35 +36,102 @@ jobs:
           RELEASE_PR: ${{ steps.release.outputs.pr }}
         run: gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$(jq -r .headBranchName <<< "$RELEASE_PR")"
 
-  publish-cli:
+  build-artifact:
     needs: release-please
+    if: ${{ needs.release-please.outputs.releases-created == 'true' || inputs.container-version != '' }}
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+      sha256: ${{ steps.package.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "20.20.0"
+          package-manager-cache: false
+      - run: npm ci
+      - id: package
+        name: Build and smoke canonical tarball
+        env:
+          MANUAL_VERSION: ${{ inputs.container-version }}
+        run: |
+          mkdir artifacts
+          version="${MANUAL_VERSION:-$(node -p "require('./packages/cli/package.json').version")}"
+          node -e "if (!/^\\d+\\.\\d+\\.\\d+$/.test(process.argv[1])) process.exit(1)" "$version"
+          source_version=$(node -p "require('./packages/cli/package.json').version")
+          test "$version" = "$source_version"
+          npm pack --workspace @miyako-lab/prompt-vault-cli --pack-destination artifacts
+          mv artifacts/*.tgz artifacts/prompt-vault.tgz
+          node scripts/smoke-cli-package.mjs --tarball artifacts/prompt-vault.tgz
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(sha256sum artifacts/prompt-vault.tgz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prompt-vault-${{ steps.package.outputs.version }}
+          path: artifacts/prompt-vault.tgz
+          if-no-files-found: error
+
+  publish-cli-version:
+    needs: [release-please, build-artifact]
     if: ${{ needs.release-please.outputs.releases-created == 'true' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
           node-version: "24"
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
-      - run: npm install --global npm@latest
-      - run: npm ci
-      - run: npm test
-      - run: npm publish --workspace @miyako-lab/prompt-vault-cli --access public
+      - uses: actions/download-artifact@v5
+        with:
+          name: prompt-vault-${{ needs.build-artifact.outputs.version }}
+          path: artifacts
+      - name: Publish the immutable npm version under the staging tag
+        run: npm publish artifacts/prompt-vault.tgz --access public --tag staged
 
-  publish-container:
-    needs: release-please
-    if: ${{ needs.release-please.outputs.releases-created == 'true' || inputs.container-version != '' }}
+  publish-cli:
+    needs: [release-please, build-artifact, publish-cli-version, publish-container]
+    if: ${{ needs.release-please.outputs.releases-created == 'true' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - id: version
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Promote npm latest or restore the previous container alias
         env:
-          MANUAL_VERSION: ${{ inputs.container-version }}
+          PREVIOUS_LATEST: ${{ needs.publish-container.outputs.previous-latest }}
+          VERSION: ${{ needs.build-artifact.outputs.version }}
         run: |
-          version="${MANUAL_VERSION:-$(node -p "require('./packages/cli/package.json').version")}"
-          node -e "if (!/^\\d+\\.\\d+\\.\\d+$/.test(process.argv[1])) process.exit(1)" "$version"
-          echo "value=$version" >> "$GITHUB_OUTPUT"
+          if npm dist-tag add "@miyako-lab/prompt-vault-cli@$VERSION" latest; then
+            npm dist-tag rm @miyako-lab/prompt-vault-cli staged || true
+            exit 0
+          fi
+          if [ -n "$PREVIOUS_LATEST" ]; then
+            docker buildx imagetools create \
+              --tag ghcr.io/yabo083/prompt-vault:latest \
+              "ghcr.io/yabo083/prompt-vault@$PREVIOUS_LATEST"
+          fi
+          exit 1
+
+  publish-container:
+    needs: [release-please, build-artifact, publish-cli-version]
+    if: ${{ always() && needs.build-artifact.result == 'success' && (inputs.container-version != '' || needs.publish-cli-version.result == 'success') }}
+    runs-on: ubuntu-latest
+    outputs:
+      previous-latest: ${{ steps.promote.outputs.previous-latest }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v5
+        with:
+          name: prompt-vault-${{ needs.build-artifact.outputs.version }}
+          path: artifacts
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -76,5 +143,37 @@ jobs:
           context: .
           push: true
           tags: |
-            ghcr.io/yabo083/prompt-vault:${{ steps.version.outputs.value }}
-            ghcr.io/yabo083/prompt-vault:latest
+            ghcr.io/yabo083/prompt-vault:${{ needs.build-artifact.outputs.version }}
+          build-args: |
+            PROMPT_VAULT_VERSION=${{ needs.build-artifact.outputs.version }}
+            PROMPT_VAULT_TARBALL_SHA256=${{ needs.build-artifact.outputs.sha256 }}
+            VCS_REF=${{ github.sha }}
+      - name: Verify the published immutable image
+        env:
+          VERSION: ${{ needs.build-artifact.outputs.version }}
+        run: |
+          name="prompt-vault-release-${GITHUB_RUN_ID}"
+          volume="prompt-vault-release-${GITHUB_RUN_ID}"
+          trap 'docker rm -f "$name" >/dev/null 2>&1 || true; docker volume rm "$volume" >/dev/null 2>&1 || true' EXIT
+          docker pull "ghcr.io/yabo083/prompt-vault:$VERSION"
+          docker run -d --name "$name" -v "$volume:/data" "ghcr.io/yabo083/prompt-vault:$VERSION"
+          for attempt in $(seq 1 60); do
+            status=$(docker inspect "$name" --format '{{.State.Health.Status}}')
+            [ "$status" = healthy ] && break
+            sleep 1
+          done
+          test "$(docker inspect "$name" --format '{{.State.Health.Status}}')" = healthy
+          test "$(docker inspect "$name" --format '{{.Config.User}}')" = node
+      - id: promote
+        name: Promote and verify the container latest alias
+        env:
+          VERSION: ${{ needs.build-artifact.outputs.version }}
+        run: |
+          previous=$(docker buildx imagetools inspect ghcr.io/yabo083/prompt-vault:latest --format '{{json .Manifest}}' 2>/dev/null | jq -r '.digest // empty' || true)
+          echo "previous-latest=$previous" >> "$GITHUB_OUTPUT"
+          docker buildx imagetools create \
+            --tag ghcr.io/yabo083/prompt-vault:latest \
+            "ghcr.io/yabo083/prompt-vault:$VERSION"
+          version_digest=$(docker buildx imagetools inspect "ghcr.io/yabo083/prompt-vault:$VERSION" --format '{{json .Manifest}}' | jq -r .digest)
+          latest_digest=$(docker buildx imagetools inspect ghcr.io/yabo083/prompt-vault:latest --format '{{json .Manifest}}' | jq -r .digest)
+          test "$version_digest" = "$latest_digest"

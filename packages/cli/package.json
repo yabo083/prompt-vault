@@ -1,14 +1,16 @@
 {
   "name": "@miyako-lab/prompt-vault-cli",
   "version": "1.2.0",
-  "description": "Authenticated command-line client for Prompt Vault hosts",
+  "description": "Run a local Prompt Vault or connect agents to an external Vault Host",
   "license": "GPL-3.0-or-later",
   "type": "module",
   "bin": {
-    "prompt-vault": "dist/index.js"
+    "prompt-vault": "dist/cli/index.js"
   },
   "files": [
     "dist",
+    "static",
+    "npm-shrinkwrap.json",
     "README.md",
     "LICENSE"
   ],
@@ -28,12 +30,18 @@
     "access": "public"
   },
   "scripts": {
-    "prepack": "npm run build:cli --prefix ../.. && node ../../scripts/prepare-cli-package.mjs"
+    "prepack": "node ../../scripts/clean-cli-package.mjs && npm run build --prefix ../.. && node ../../scripts/prepare-cli-package.mjs"
   },
   "dependencies": {
-    "@napi-rs/keyring": "^1.3.0",
+    "@hono/node-server": "^2.0.12",
     "commander": "^14.0.3",
+    "diff": "^9.0.0",
+    "hono": "^4.12.32",
+    "open": "^10.2.0",
     "proper-lockfile": "^4.1.2",
     "zod": "^4.4.3"
+  },
+  "optionalDependencies": {
+    "@napi-rs/keyring": "^1.3.0"
   }
 }

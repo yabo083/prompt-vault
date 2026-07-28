@@ -31,8 +31,7 @@ async function acquireLock(lockFile: string) {
   throw new Error(`Could not acquire token lock: ${lockFile}`);
 }
 
-export async function loadOrCreateHostToken({ tokenFile, envToken = "" }: { tokenFile: string; envToken?: string }) {
-  if (envToken.trim()) return envToken.trim();
+export async function loadOrCreateHostToken({ tokenFile }: { tokenFile: string }) {
   const existing = await readToken(tokenFile);
   if (existing) return existing;
   await mkdir(dirname(tokenFile), { recursive: true });

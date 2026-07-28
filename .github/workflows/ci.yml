@@ -23,17 +23,39 @@ jobs:
       - run: npm test
       - run: npm run typecheck
       - run: npm run build
-      - name: Verify installed CLI package
-        run: |
-          mkdir -p /tmp/prompt-vault-cli/package /tmp/prompt-vault-cli/install
-          npm pack --workspace @miyako-lab/prompt-vault-cli --pack-destination /tmp/prompt-vault-cli/package
-          npm install --prefix /tmp/prompt-vault-cli/install /tmp/prompt-vault-cli/package/*.tgz
-          test "$(/tmp/prompt-vault-cli/install/node_modules/.bin/prompt-vault --version)" = "$(node -p "require('./packages/cli/package.json').version")"
+
+  package-smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "20.20.0"
+          package-manager-cache: false
+      - run: npm ci
+      - run: node scripts/smoke-cli-package.mjs
 
   container:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "20.20.0"
+          package-manager-cache: false
+      - run: npm ci
+      - id: artifact
+        name: Build and smoke canonical tarball
+        run: |
+          mkdir artifacts
+          npm pack --workspace @miyako-lab/prompt-vault-cli --pack-destination artifacts
+          mv artifacts/*.tgz artifacts/prompt-vault.tgz
+          node scripts/smoke-cli-package.mjs --tarball artifacts/prompt-vault.tgz
+          echo "sha256=$(sha256sum artifacts/prompt-vault.tgz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@v3
       - uses: docker/build-push-action@v6
         with:
@@ -41,6 +63,10 @@ jobs:
           push: false
           load: true
           tags: prompt-vault:ci
+          build-args: |
+            PROMPT_VAULT_VERSION=ci
+            PROMPT_VAULT_TARBALL_SHA256=${{ steps.artifact.outputs.sha256 }}
+            VCS_REF=${{ github.sha }}
       - name: Verify runtime contract
         run: |
           docker run -d --name prompt-vault-ci -v prompt-vault-ci-data:/data prompt-vault:ci
@@ -62,3 +88,5 @@ jobs:
           test "$(docker inspect prompt-vault-ci --format '{{.State.Health.Status}}')" = healthy
           second_token=$(docker exec prompt-vault-ci sha256sum /data/.vault-token | cut -d' ' -f1)
           test "$first_token" = "$second_token"
+          docker rm -f prompt-vault-ci
+          docker volume rm prompt-vault-ci-data

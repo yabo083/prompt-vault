@@ -6,13 +6,13 @@
     "strict": true,
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "rootDir": "src/cli",
+    "rootDir": "src",
     "outDir": "packages/cli/dist",
     "sourceMap": true,
     "declaration": true,
     "declarationMap": true,
     "types": ["node"]
   },
-  "include": ["src/cli/**/*.ts"],
-  "exclude": ["src/cli/**/*.test.ts"]
+  "include": ["src/cli/**/*.ts", "src/core/**/*.ts", "src/server/**/*.ts"],
+  "exclude": ["src/**/*.test.ts"]
 }
