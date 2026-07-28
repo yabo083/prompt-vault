@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.1](https://github.com/yabo083/prompt-vault/compare/v1.3.0...v1.3.1) (2026-07-28)
+
+
+### Bug Fixes
+
+* publish staged release tarballs by file path ([c6ecad2](https://github.com/yabo083/prompt-vault/commit/c6ecad2de7ec8f204fe22ae67e7ad0b169e8e6d6))
+
 ## [1.3.0](https://github.com/yabo083/prompt-vault/compare/v1.2.0...v1.3.0) (2026-07-28)
 
 
