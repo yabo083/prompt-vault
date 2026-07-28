@@ -61,13 +61,14 @@ npm install --global @miyako-lab/prompt-vault-cli
 Authorize it against a Vault Host:
 
 ```bash
-prompt-vault --host http://localhost:8767 auth login --name local
-prompt-vault --json --host local theme list
+prompt-vault connect http://localhost:8767 --name local
+prompt-vault
+prompt-vault theme list
 ```
 
 The CLI opens a browser approval page. It never stores the Host Token. Approval creates a separate bearer credential that can be replaced by reauthorizing or revoked with `prompt-vault auth logout`.
 
-Use `--json` for the stable `{ ok, data }` or `{ ok, error }` envelope expected by automation. See the [CLI guide](docs/cli.md) for all commands and the two-step agent authorization flow.
+The current Vault Host is used automatically. Agent and pipeline stdout receives the stable `{ ok, data }` or `{ ok, error }` envelope automatically; `--json` only forces that format in an interactive terminal. See the [CLI guide](docs/cli.md) for all commands and the two-step agent authorization flow.
 
 ## Agent Skill
 
@@ -76,10 +77,10 @@ The repository ships a portable [Agent Skills](https://agentskills.io/) workflow
 Install it for supported clients, including OpenCode, Claude Code, and Codex:
 
 ```bash
-npx skills add yabo083/prompt-vault
+npx skills add yabo083/prompt-vault --skill prompt-vault -g -a opencode -a claude-code -a codex -y
 ```
 
-The skill uses two-step browser authorization so an agent can return the approval URL and code before waiting for the user. It requires explicit user confirmation for Draft discard, forced replacement, Theme deletion, and permanent Revision deletion.
+The installer detects supported clients such as OpenCode, Claude Code, and Codex. The skill can use the npm CLI through `npx` when it is not installed globally, discovers the current Host, and asks only for a Vault URL and one-time approval when setup is missing. It requires explicit user confirmation for Draft discard, forced replacement, Theme deletion, and permanent Revision deletion.
 
 ## Domain Model
 

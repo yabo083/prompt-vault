@@ -52,8 +52,24 @@ describe("prompt-vault CLI process", () => {
     expect(result).toMatchObject({ code: 0, stdout: `${manifest.version}\n`, stderr: "" });
   });
 
+  it("defaults agent pipes to JSON and reports setup state from the root command", async () => {
+    const configDirectory = await mkdtemp(join(tmpdir(), "prompt-vault-cli-defaults-"));
+    const env = { PROMPT_VAULT_CONFIG_DIR: configDirectory, PROMPT_VAULT_CREDENTIAL_STORE: "file" };
+
+    const hosts = await runCli(["host", "list"], env);
+    expect(hosts).toMatchObject({ code: 0, stderr: "" });
+    expect(JSON.parse(hosts.stdout)).toEqual({ ok: true, data: [] });
+
+    const status = await runCli([], env);
+    expect(status).toMatchObject({ code: 0, stderr: "" });
+    expect(JSON.parse(status.stdout)).toMatchObject({
+      ok: true,
+      data: { configured: false, authenticated: false, currentHost: null },
+    });
+  });
+
   it("returns parser failures through the JSON error contract", async () => {
-    const result = await runCli(["--json", "theme", "show"], {});
+    const result = await runCli(["theme", "show"], {});
 
     expect(result).toMatchObject({ code: 2, stderr: "" });
     expect(JSON.parse(result.stdout)).toMatchObject({
@@ -117,7 +133,7 @@ describe("prompt-vault CLI process", () => {
     };
 
     try {
-      const login = runCli(["--json", "auth", "login", "--host", host, "--name", "test", "--no-browser"], env);
+      const login = runCli(["connect", host, "--name", "test", "--no-browser"], env);
       const pending = await waitForPendingRequest(host, "host-token");
       const approval = await fetch(`${host}/api/v2/auth/device/${pending.requestId}/approve`, {
         method: "POST",
@@ -130,6 +146,15 @@ describe("prompt-vault CLI process", () => {
       expect(loggedIn.stderr).toContain(`Open ${host}/auth/cli/`);
       expect(loggedIn.stderr).toContain(`Code: ${pending.userCode}`);
       expect(loggedIn.stdout).not.toContain("pv_");
+      expect(JSON.parse(loggedIn.stdout)).toMatchObject({ ok: true, data: { host: "test", authenticated: true } });
+
+      const implicitHost = await runCli(["theme", "list"], env);
+      expect(JSON.parse(implicitHost.stdout)).toMatchObject({ ok: true, data: [{ slug: "legacy-fixture" }] });
+      const rootStatus = await runCli([], env);
+      expect(JSON.parse(rootStatus.stdout)).toMatchObject({
+        ok: true,
+        data: { configured: true, currentHost: "test", url: host, authenticated: true, identity: { kind: "cli" } },
+      });
 
       const requested = await runCli(["--json", "--host", host, "auth", "request", "--name", "test"], env);
       const requestPayload = JSON.parse(requested.stdout).data;
@@ -301,6 +326,11 @@ describe("prompt-vault CLI process", () => {
       expect(concurrentHosts.map((entry: { name: string }) => entry.name)).toEqual(["alpha", "beta", "test"]);
       expect(concurrentHosts.filter((entry: { current: boolean }) => entry.current)).toHaveLength(1);
       expect((await runCli(["--json", "host", "use", "test"], env)).code).toBe(0);
+      const overriddenStatus = await runCli(["--host", "beta"], env);
+      expect(JSON.parse(overriddenStatus.stdout)).toMatchObject({
+        ok: true,
+        data: { configured: true, currentHost: "beta", authenticated: true },
+      });
 
       const blockedConfig = join(directory, "blocked-config");
       await writeFile(blockedConfig, "not a directory", "utf8");
@@ -329,6 +359,11 @@ describe("prompt-vault CLI process", () => {
       const afterLogout = await runCli(["--json", "--host", "test", "theme", "list"], env);
       expect(afterLogout.code).toBe(4);
       expect(JSON.parse(afterLogout.stdout)).toMatchObject({ ok: false, error: { code: "AUTH_REQUIRED" } });
+      const noCurrentStatus = await runCli([], env);
+      expect(JSON.parse(noCurrentStatus.stdout)).toMatchObject({
+        ok: true,
+        data: { configured: true, currentHost: null, authenticated: false, hosts: ["alpha", "beta", "test"] },
+      });
       expect((await runCli(["--json", "auth", "logout", "--host", "alpha"], env)).code).toBe(0);
       expect((await runCli(["--json", "auth", "logout", "--host", "beta"], env)).code).toBe(0);
     } finally {

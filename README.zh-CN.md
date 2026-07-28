@@ -61,13 +61,14 @@ npm install --global @miyako-lab/prompt-vault-cli
 授权一个 Vault Host：
 
 ```bash
-prompt-vault --host http://localhost:8767 auth login --name local
-prompt-vault --json --host local theme list
+prompt-vault connect http://localhost:8767 --name local
+prompt-vault
+prompt-vault theme list
 ```
 
 CLI 会打开浏览器批准页面，并且不会存储 Host Token。批准后生成独立的 bearer credential；重新授权会替换旧凭据，也可以通过 `prompt-vault auth logout` 撤销。
 
-自动化调用应使用 `--json`，获得稳定的 `{ ok, data }` 或 `{ ok, error }` 返回结构。完整命令和 agent 两步授权流程参见 [CLI 文档](docs/cli.md)。
+CLI 会自动使用当前 Vault Host。Agent 或管道的非交互 stdout 会自动获得稳定的 `{ ok, data }` 或 `{ ok, error }` 返回结构；`--json` 仅用于在交互终端中强制 JSON。完整命令和 agent 两步授权流程参见 [CLI 文档](docs/cli.md)。
 
 ## Agent Skill
 
@@ -76,10 +77,10 @@ CLI 会打开浏览器批准页面，并且不会存储 Host Token。批准后�
 OpenCode、Claude Code、Codex 等兼容客户端可使用以下命令安装：
 
 ```bash
-npx skills add yabo083/prompt-vault
+npx skills add yabo083/prompt-vault --skill prompt-vault -g -a opencode -a claude-code -a codex -y
 ```
 
-Skill 使用两步浏览器授权，使 agent 可以先返回批准 URL 和验证码，再等待用户操作。丢弃 Draft、强制覆盖、删除 Theme 和永久删除 Revision 都必须获得用户明确确认。
+安装器会自动检测 OpenCode、Claude Code、Codex 等兼容客户端。全局 CLI 不存在时，Skill 会通过 `npx` 自动调用 npm CLI；没有 Host 配置时只询问 Vault URL，并发起一次性批准。丢弃 Draft、强制覆盖、删除 Theme 和永久删除 Revision 都必须获得用户明确确认。
 
 ## 领域模型
 

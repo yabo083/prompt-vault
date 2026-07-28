@@ -272,6 +272,48 @@ function output(data: unknown, json: boolean | undefined) {
   process.stdout.write(`${JSON.stringify(data, null, 2)}\n`);
 }
 
+async function currentConnectionStatus(selector?: string) {
+  const connection = await resolveConnection(selector);
+  if (!connection) {
+    if (selector) throw new CliError("HOST_REQUIRED", `Unknown Vault Host: ${selector}`, 2);
+    const hosts = await listHosts();
+    if (hosts.length) {
+      return { version: VERSION, configured: true as const, currentHost: null, authenticated: false as const, hosts: hosts.map((host) => host.name) };
+    }
+    return { version: VERSION, configured: false as const, currentHost: null, authenticated: false as const };
+  }
+  if (!connection.token) {
+    return { version: VERSION, configured: true as const, currentHost: connection.name, url: connection.url, authenticated: false as const };
+  }
+  try {
+    const identity = await request("/api/v2/auth/session", { host: connection.name });
+    return { version: VERSION, configured: true as const, currentHost: connection.name, url: connection.url, authenticated: true as const, identity };
+  } catch (error) {
+    if (error instanceof CliError && error.code === "UNAUTHORIZED") {
+      return { version: VERSION, configured: true as const, currentHost: connection.name, url: connection.url, authenticated: false as const };
+    }
+    throw error;
+  }
+}
+
+function outputRootStatus(status: Awaited<ReturnType<typeof currentConnectionStatus>>, json: boolean | undefined) {
+  if (json) return output(status, true);
+  process.stdout.write(`Prompt Vault ${status.version}\n`);
+  if (!status.configured) {
+    process.stdout.write("No Vault Host configured.\nConnect with: prompt-vault connect <url>\n");
+    return;
+  }
+  if (!status.currentHost) {
+    const hosts = "hosts" in status && Array.isArray(status.hosts) ? status.hosts : [];
+    process.stdout.write(`Configured Hosts: ${hosts.join(", ")}\n`);
+    process.stdout.write("No current Vault Host selected.\nSelect with: prompt-vault host use <name>\n");
+    return;
+  }
+  process.stdout.write(`Host: ${status.currentHost} (${status.url})\n`);
+  process.stdout.write(`Status: ${status.authenticated ? "authenticated" : "authentication required"}\n`);
+  process.stdout.write("Next: prompt-vault theme list\n");
+}
+
 const program = new Command();
 let parserMessage = "";
 program
@@ -279,13 +321,26 @@ program
   .description("Operate an authenticated Prompt Vault host")
   .version(VERSION)
   .option("--host <host>", "Vault Host name or URL")
-  .option("--json", "Emit deterministic JSON");
+  .option("--json", "Emit deterministic JSON", !process.stdout.isTTY)
+  .action(async () => {
+    const options = program.opts<CliOptions>();
+    outputRootStatus(await currentConnectionStatus(options.host || process.env.PROMPT_VAULT_HOST), options.json);
+  });
 program.exitOverride();
 program.configureOutput({
   writeErr(message) {
     parserMessage += message;
   },
 });
+
+program.command("connect")
+  .description("Connect and select a Vault Host")
+  .argument("<url>", "Vault Host URL")
+  .option("--name <name>", "Local host name", "default")
+  .option("--no-browser", "Print the approval URL without opening a browser")
+  .action(async (url, commandOptions) => {
+    output(await login(url, commandOptions.name, Boolean(commandOptions.browser === false)), program.opts<CliOptions>().json);
+  });
 
 const theme = program.command("theme").description("Inspect Themes");
 theme.command("list").option("--query <text>", "Search query", "").action(async (commandOptions) => {
