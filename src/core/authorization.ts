@@ -37,6 +37,7 @@ export interface AuthorizationStore {
   }>;
   inspectDeviceRequest(requestId: string, userCode: string): Promise<Pick<DeviceRequest, "requestId" | "userCode" | "label" | "expiresAt"> | null>;
   pollDeviceRequest(requestId: string): Promise<{ status: "pending" } | { status: "approved"; token: string } | { status: "expired" } | null>;
+  discardDeviceRequest(requestId: string): Promise<boolean>;
   listPendingRequests(): Promise<Array<Pick<DeviceRequest, "requestId" | "userCode" | "label" | "expiresAt">>>;
   approveDeviceRequest(requestId: string, userCode: string): Promise<boolean>;
   authenticate(token: string): Promise<CliIdentity | null>;
@@ -150,6 +151,10 @@ export async function createAuthorizationStore({
       }
       if (!request.token) return { status: "pending" };
       return { status: "approved", token: request.token };
+    },
+
+    async discardDeviceRequest(requestId: string) {
+      return pending.delete(requestId);
     },
 
     async listPendingRequests() {

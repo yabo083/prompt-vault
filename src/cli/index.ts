@@ -7,6 +7,7 @@ import { basename, resolve as resolvePath } from "node:path";
 import { Command, CommanderError } from "commander";
 import { z } from "zod";
 import { listHosts, removeLogin, resolveConnection, saveLogin, useHost } from "./config.js";
+import { VERSION } from "./version.js";
 
 type CliOptions = { host?: string; json?: boolean };
 
@@ -142,8 +143,8 @@ function addDraftOptions(command: Command, titleRequired = false) {
   return command;
 }
 
-async function openBrowser(url: string) {
-  if (process.env.PROMPT_VAULT_NO_BROWSER === "1") return true;
+async function openBrowser(url: string, disabled = false) {
+  if (disabled || process.env.PROMPT_VAULT_NO_BROWSER === "1") return true;
   const [command, args] = process.platform === "win32"
     ? ["cmd", ["/c", "start", "", url]]
     : process.platform === "darwin"
@@ -159,7 +160,7 @@ async function openBrowser(url: string) {
   });
 }
 
-async function login(host: string, name: string) {
+function parseHost(host: string) {
   let hostUrl: URL;
   try {
     hostUrl = new URL(host);
@@ -168,6 +169,11 @@ async function login(host: string, name: string) {
   }
   if (!new Set(["http:", "https:"]).has(hostUrl.protocol)) throw new CliError("INVALID_HOST", "Vault Host must use http or https", 2);
   const url = hostUrl.toString().replace(/\/$/, "");
+  return { hostUrl, url };
+}
+
+async function requestLogin(host: string) {
+  const { hostUrl, url } = parseHost(host);
   const created = await fetchHost(new URL("/api/v2/auth/device", url), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -181,42 +187,78 @@ async function login(host: string, name: string) {
   if (verificationUrl.origin !== hostUrl.origin || !new Set(["http:", "https:"]).has(verificationUrl.protocol)) {
     throw new CliError("INVALID_VERIFICATION_URI", "Vault Host returned a cross-origin verification URL", 3);
   }
-  process.stderr.write(`Open ${verificationUrl.toString()}\nCode: ${device.userCode}\n`);
-  if (!(await openBrowser(verificationUrl.toString()))) process.stderr.write("Browser could not be opened; use the URL above.\n");
-  const deadline = Date.now() + device.expiresIn * 1_000;
-  while (Date.now() < deadline) {
-    const response = await fetchHost(new URL(`/api/v2/auth/device/${device.requestId}`, url));
-    if (response.status === 200) {
-      const parsedApproval = approvedResponseSchema.safeParse(await jsonPayload(response));
-      if (!parsedApproval.success) throw new CliError("INVALID_HOST_RESPONSE", "Vault Host returned an invalid credential", 3);
-      const approved = parsedApproval.data;
+  return { url, device };
+}
+
+async function saveApprovedLogin(name: string, url: string, token: string) {
+  try {
+    const existing = await resolveConnection(name);
+    const saved = await saveLogin(name, url, token);
+    if (existing?.token && existing.token !== token) {
       try {
-        const existing = await resolveConnection(name);
-        const saved = await saveLogin(name, url, approved.token);
-        if (existing?.token) {
-          try {
-            const revoked = await fetchHost(new URL("/api/v2/auth/session", existing.url), {
-              method: "DELETE",
-              headers: { Authorization: `Bearer ${existing.token}` },
-            });
-            if (!revoked.ok && revoked.status !== 401) {
-              process.stderr.write(`Warning: the previous credential could not be revoked (${revoked.status}).\n`);
-            }
-          } catch {
-            process.stderr.write("Warning: the previous credential could not be revoked because the Vault Host became unreachable.\n");
-          }
-        }
-        return { host: saved.name, url: saved.url, authenticated: true, userCode: device.userCode };
-      } catch (error) {
-        await fetchHost(new URL("/api/v2/auth/session", url), {
+        const revoked = await fetchHost(new URL("/api/v2/auth/session", existing.url), {
           method: "DELETE",
-          headers: { Authorization: `Bearer ${approved.token}` },
-        }).catch(() => undefined);
-        throw error;
+          headers: { Authorization: `Bearer ${existing.token}` },
+        });
+        if (!revoked.ok && revoked.status !== 401) {
+          process.stderr.write(`Warning: the previous credential could not be revoked (${revoked.status}).\n`);
+        }
+      } catch {
+        process.stderr.write("Warning: the previous credential could not be revoked because the Vault Host became unreachable.\n");
       }
     }
-    if (response.status === 410) throw new CliError("AUTH_EXPIRED", "Authorization request expired", 4);
-    if (response.status !== 202) throw new CliError("AUTH_FAILED", `Authorization failed (${response.status})`, 4);
+    return { host: saved.name, url: saved.url, authenticated: true as const };
+  } catch (error) {
+    const revoked = await fetchHost(new URL("/api/v2/auth/session", url), {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then((response) => response.ok || response.status === 401)
+      .catch(() => false);
+    const message = error instanceof Error ? error.message : "Credential storage failed";
+    if (!revoked) {
+      throw new CliError("AUTH_RECOVERY_REQUIRED", `${message}. The Vault Host credential could not be revoked; retry auth complete with the same request.`, 4);
+    }
+    throw new CliError("CREDENTIAL_SAVE_FAILED_REVOKED", `${message}. The unused Vault Host credential was revoked.`, 4);
+  }
+}
+
+async function discardLoginRequest(url: string, requestId: string) {
+  const response = await fetchHost(new URL(`/api/v2/auth/device/${encodeURIComponent(requestId)}`, url), { method: "DELETE" });
+  if (!response.ok && response.status !== 404) {
+    throw new CliError("AUTH_CONFIRM_FAILED", `Credential was saved, but the Vault Host could not confirm authorization completion (${response.status}). Retry auth complete with the same request.`, 4);
+  }
+}
+
+async function completeLogin(host: string, name: string, requestId: string) {
+  const { url } = parseHost(host);
+  const response = await fetchHost(new URL(`/api/v2/auth/device/${encodeURIComponent(requestId)}`, url));
+  if (response.status === 202) return { status: "pending" as const, host: name, url };
+  if (response.status === 410) throw new CliError("AUTH_EXPIRED", "Authorization request expired", 4);
+  if (response.status !== 200) throw new CliError("AUTH_FAILED", `Authorization failed (${response.status})`, 4);
+  const parsedApproval = approvedResponseSchema.safeParse(await jsonPayload(response));
+  if (!parsedApproval.success) throw new CliError("INVALID_HOST_RESPONSE", "Vault Host returned an invalid credential", 3);
+  try {
+    const saved = await saveApprovedLogin(name, url, parsedApproval.data.token);
+    await discardLoginRequest(url, requestId);
+    return { status: "approved" as const, ...saved };
+  } catch (error) {
+    if (error instanceof CliError && error.code === "CREDENTIAL_SAVE_FAILED_REVOKED") {
+      await discardLoginRequest(url, requestId).catch(() => undefined);
+    }
+    throw error;
+  }
+}
+
+async function login(host: string, name: string, noBrowser = false) {
+  const { url, device } = await requestLogin(host);
+  const verificationUrl = new URL(device.verificationUri);
+  process.stderr.write(`Open ${verificationUrl.toString()}\nCode: ${device.userCode}\n`);
+  if (!(await openBrowser(verificationUrl.toString(), noBrowser))) process.stderr.write("Browser could not be opened; use the URL above.\n");
+  const deadline = Date.now() + device.expiresIn * 1_000;
+  while (Date.now() < deadline) {
+    const completed = await completeLogin(url, name, device.requestId);
+    if (completed.status === "approved") return { ...completed, userCode: device.userCode };
     await new Promise((resolve) => setTimeout(resolve, Math.max(50, device.interval * 1_000)));
   }
   throw new CliError("AUTH_EXPIRED", "Authorization request expired", 4);
@@ -235,6 +277,7 @@ let parserMessage = "";
 program
   .name("prompt-vault")
   .description("Operate an authenticated Prompt Vault host")
+  .version(VERSION)
   .option("--host <host>", "Vault Host name or URL")
   .option("--json", "Emit deterministic JSON");
 program.exitOverride();
@@ -443,12 +486,31 @@ workspace.command("synchronize").description("Scan Themes for unsaved Drafts and
 });
 
 const auth = program.command("auth").description("Authenticate Vault Hosts");
-auth.command("login")
+auth.command("request")
+  .description("Start browser authorization and return immediately")
   .option("--name <name>", "Local host name", "default")
   .action(async (commandOptions) => {
     const options = program.opts<CliOptions>();
     if (!options.host) throw new CliError("HOST_REQUIRED", "Pass --host with the Vault Host URL.", 2);
-    output(await login(options.host, commandOptions.name), options.json);
+    const requested = await requestLogin(options.host);
+    output({ host: commandOptions.name, url: requested.url, ...requested.device }, options.json);
+  });
+auth.command("complete")
+  .description("Complete a previously approved browser authorization")
+  .requiredOption("--request <requestId>", "Authorization request ID")
+  .option("--name <name>", "Local host name", "default")
+  .action(async (commandOptions) => {
+    const options = program.opts<CliOptions>();
+    if (!options.host) throw new CliError("HOST_REQUIRED", "Pass --host with the Vault Host URL.", 2);
+    output(await completeLogin(options.host, commandOptions.name, commandOptions.request), options.json);
+  });
+auth.command("login")
+  .option("--name <name>", "Local host name", "default")
+  .option("--no-browser", "Print the approval URL without opening a browser")
+  .action(async (commandOptions) => {
+    const options = program.opts<CliOptions>();
+    if (!options.host) throw new CliError("HOST_REQUIRED", "Pass --host with the Vault Host URL.", 2);
+    output(await login(options.host, commandOptions.name, Boolean(commandOptions.browser === false)), options.json);
   });
 auth.command("status").action(async () => {
   const options = program.opts<CliOptions>();
@@ -483,7 +545,7 @@ host.command("use").argument("<name>").action(async (name) => output(await useHo
 try {
   await program.parseAsync(process.argv);
 } catch (error) {
-  if (error instanceof CommanderError && error.code === "commander.helpDisplayed") process.exit(0);
+  if (error instanceof CommanderError && new Set(["commander.helpDisplayed", "commander.version"]).has(error.code)) process.exit(0);
   const cliError = error instanceof CliError
     ? error
     : error instanceof CommanderError

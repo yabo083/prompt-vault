@@ -1,0 +1,25 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "bootstrap-sha": "92d372da1be56a5b03e1e8857edd4f714f6172d0",
+  "packages": {
+    ".": {
+      "release-type": "node",
+      "package-name": "prompt-vault",
+      "component": "prompt-vault",
+      "include-component-in-tag": false,
+      "changelog-path": "CHANGELOG.md",
+      "extra-files": [
+        {
+          "type": "json",
+          "path": "packages/cli/package.json",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "json",
+          "path": "package-lock.json",
+          "jsonpath": "$['packages']['packages/cli']['version']"
+        }
+      ]
+    }
+  }
+}

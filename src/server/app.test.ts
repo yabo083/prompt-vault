@@ -12,6 +12,17 @@ import { createHttpApp } from "./app.js";
 const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64");
 
 describe("Prompt Vault HTTP adapter", () => {
+  it("exposes an unauthenticated health check", async () => {
+    const app = createHttpApp({
+      vault: createPromptVault({ workspace: await copyLegacyWorkspace() }),
+      token: "host-token",
+    });
+
+    const response = await app.request("/healthz");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ status: "ok" });
+  });
+
   it("serves the production browser bundle from the Node host", async () => {
     const directory = await mkdtemp(join(tmpdir(), "prompt-vault-static-"));
     const staticDirectory = join(directory, "static");
@@ -552,6 +563,8 @@ describe("Prompt Vault HTTP adapter", () => {
     const repeated = await app.request(`/api/v2/auth/device/${request.requestId}`);
     expect(repeated.status).toBe(200);
     expect(await repeated.json()).toEqual(credential);
+    expect((await app.request(`/api/v2/auth/device/${request.requestId}`, { method: "DELETE" })).status).toBe(204);
+    expect((await app.request(`/api/v2/auth/device/${request.requestId}`)).status).toBe(404);
 
     const themes = await app.request("/api/v2/themes", { headers: { Authorization: `Bearer ${credential.token}` } });
     expect(themes.status).toBe(200);

@@ -1,57 +1,141 @@
 # Deployment
 
-## Production Contract
+## Docker Compose
 
-Production requires Node.js 20 or newer. Python is not an application dependency.
-
-The service needs compiled output in `dist`, the browser bundle in `static/dist`, production dependencies in `node_modules`, a writable workspace, and a strong `PROMPT_VAULT_TOKEN` supplied outside source control.
-
-The checked-in unit `deploy/prompt-vault.service` uses `/root/prompt-vault` as the application directory and `/root/prompt-vault/workspace` as persistent data.
-
-## Pre-Deploy Verification
+The published image is `ghcr.io/yabo083/prompt-vault`. The included `compose.yaml` uses a named volume for `/data` and publishes port `8767`.
 
 ```bash
+curl -LO https://raw.githubusercontent.com/yabo083/prompt-vault/main/compose.yaml
+docker compose up -d
+docker compose exec prompt-vault cat /data/.vault-token
+```
+
+Compose binds to `127.0.0.1` by default. Set `PROMPT_VAULT_BIND=0.0.0.0` only when deliberate LAN exposure is protected by a trusted network or HTTPS proxy.
+
+The first start creates:
+
+- `/data/workspace`: Themes, Drafts, Revisions, and Assets
+- `/data/.vault-token`: generated Host Token
+- `/data/.vault-auth`: revocable CLI credentials
+
+Check health and logs with:
+
+```bash
+docker compose ps
+docker compose logs --tail 100 prompt-vault
+curl http://127.0.0.1:8767/healthz
+```
+
+### Upgrade
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+Pin a release by setting `PROMPT_VAULT_VERSION` before `docker compose up`, for example `PROMPT_VAULT_VERSION=1.2.0`.
+
+### Backup
+
+Stop writes, archive the named volume, then restart:
+
+```bash
+docker compose stop prompt-vault
+docker run --rm \
+  -v prompt-vault_prompt-vault-data:/data:ro \
+  -v "$PWD":/backup \
+  alpine tar czf /backup/prompt-vault-data.tgz -C /data .
+docker compose start prompt-vault
+```
+
+Test restoration into a separate volume periodically. A backup is not proven until it has been restored and opened successfully.
+
+### Rotate The Generated Host Token
+
+Stop the server, remove only the token file, and restart:
+
+```bash
+docker compose stop prompt-vault
+docker compose run --rm --no-deps --entrypoint sh prompt-vault -c 'rm -f /data/.vault-token'
+docker compose up -d
+docker compose exec prompt-vault cat /data/.vault-token
+```
+
+Existing browser cookies stop authenticating after rotation. CLI credentials remain independently valid; each client can revoke its own credential with `prompt-vault auth logout`, and host administrators can use the authenticated credential API for central revocation.
+
+## HTTPS And Public Origin
+
+Bind Prompt Vault to a trusted network or place it behind an authenticated HTTPS reverse proxy. When using a stable external URL, add these variables to a Compose override:
+
+```yaml
+services:
+  prompt-vault:
+    environment:
+      PROMPT_VAULT_PUBLIC_URL: https://vault.example.com
+      PROMPT_VAULT_TRUSTED_PROXIES: 172.18.0.1
+```
+
+Only list proxy IP addresses you operate. `PROMPT_VAULT_PUBLIC_URL` controls secure cookie behavior, same-origin write checks, and CLI approval URLs.
+
+## Source Build
+
+Production requires Node.js 20.20 or newer, compiled server output in `dist`, the browser bundle in `static/dist`, production dependencies, and a writable data directory.
+
+```bash
+git clone https://github.com/yabo083/prompt-vault.git
+cd prompt-vault
 npm ci
 npm test
 npm run typecheck
 npm run build
-npm audit --audit-level=low
+npm prune --omit=dev
 ```
 
-Do not deploy when any command fails.
+Start with environment variables appropriate for the host:
 
-## Release Procedure
+```bash
+HOST=127.0.0.1 \
+PORT=8767 \
+PROMPT_VAULT_WORKSPACE=/var/lib/prompt-vault/workspace \
+PROMPT_VAULT_TOKEN_FILE=/var/lib/prompt-vault/.vault-token \
+PROMPT_VAULT_CREDENTIAL_DIRECTORY=/var/lib/prompt-vault/.vault-auth \
+PROMPT_VAULT_STATIC_DIRECTORY="$PWD/static/dist" \
+node dist/server/index.js
+```
 
-1. Back up the workspace separately from the application directory.
-2. Build the release locally or on a staging host.
-3. Synchronize application files without replacing `workspace` or server-local environment files.
-4. Run `npm ci --omit=dev` when `node_modules` is not included in the release.
-5. Install `deploy/prompt-vault.service`, then run `systemctl daemon-reload`.
-6. Restart with `systemctl restart prompt-vault.service`.
-7. Confirm `systemctl is-active prompt-vault.service` and inspect recent journal output.
+## systemd
 
-The service command is `/usr/bin/node /root/prompt-vault/dist/server/index.js`.
+The example unit expects:
 
-## Smoke Test
+- application symlink: `/opt/prompt-vault/current`
+- dedicated user and group: `prompt-vault`
+- writable data directory: `/var/lib/prompt-vault`
+- optional environment file: `/etc/prompt-vault/prompt-vault.env`
 
-Verify `/` and static files load, browser sign-in lists existing Themes, `/api/v2/capabilities` responds, and an existing Revision image loads. Verify CLI browser authorization, `capabilities`, and `auth logout`. A disposable Theme should complete Draft edit, Asset upload, publish, Continue, duplicate, and safe deletion into `.trash`.
+Prepare the host, install a built release, and enable the unit:
 
-Use disposable data for write tests and record IDs before cleanup.
+```bash
+VERSION="$(node -p "require('./package.json').version")"
+sudo useradd --system --home /var/lib/prompt-vault --shell /usr/sbin/nologin prompt-vault
+sudo install -d -o prompt-vault -g prompt-vault /var/lib/prompt-vault
+sudo install -d "/opt/prompt-vault/releases/$VERSION" /etc/prompt-vault
+sudo cp -a dist static node_modules package.json package-lock.json "/opt/prompt-vault/releases/$VERSION/"
+sudo ln -sfn "/opt/prompt-vault/releases/$VERSION" /opt/prompt-vault/current
+sudo cp deploy/prompt-vault.service /etc/systemd/system/
+sudo install -m 600 deploy/prompt-vault.env.example /etc/prompt-vault/prompt-vault.env
+sudo systemctl daemon-reload
+sudo systemctl enable --now prompt-vault.service
+```
+
+Keep the workspace and credentials outside release directories. Deploy a new version into a versioned directory, atomically update `/opt/prompt-vault/current`, and restart the service.
 
 ## Rollback
 
 Application rollback and data rollback are separate decisions.
 
-1. Stop the service.
-2. Restore the previous application archive and service unit.
-3. Restore the workspace only when it is damaged or the release changed data incompatibly.
-4. Run `systemctl daemon-reload`, start the service, and repeat read-only smoke checks.
+1. Stop or drain writes.
+2. Point the container tag or `/opt/prompt-vault/current` at the previous application release.
+3. Restart and perform read-only health, Theme, and Asset checks.
+4. Restore workspace data only when it is damaged or a release changed it incompatibly.
 
-Compatibility reads preserve existing workspaces. Keep a known-good application archive and a contemporaneous workspace archive until a release has passed real usage.
-
-## Security
-
-- Bind to a trusted interface or use an authenticated HTTPS reverse proxy.
-- Keep `PROMPT_VAULT_TOKEN` in a protected environment file.
-- Protect workspace, configuration, and backup files as sensitive data.
-- Cookie writes are same-origin protected, but HTTPS is required across untrusted networks.
+Keep a known-good application release and a contemporaneous data backup until a new release has passed real usage.

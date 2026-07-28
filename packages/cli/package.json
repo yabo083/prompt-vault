@@ -1,0 +1,39 @@
+{
+  "name": "@miyako-lab/prompt-vault-cli",
+  "version": "1.0.0",
+  "description": "Authenticated command-line client for Prompt Vault hosts",
+  "license": "GPL-3.0-or-later",
+  "type": "module",
+  "bin": {
+    "prompt-vault": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20.20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yabo083/prompt-vault.git",
+    "directory": "packages/cli"
+  },
+  "homepage": "https://github.com/yabo083/prompt-vault#readme",
+  "bugs": {
+    "url": "https://github.com/yabo083/prompt-vault/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "prepack": "npm run build:cli --prefix ../.. && node ../../scripts/prepare-cli-package.mjs"
+  },
+  "dependencies": {
+    "@napi-rs/keyring": "^1.3.0",
+    "commander": "^14.0.3",
+    "proper-lockfile": "^4.1.2",
+    "zod": "^4.4.3"
+  }
+}

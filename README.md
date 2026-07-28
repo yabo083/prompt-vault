@@ -1,96 +1,131 @@
 # Prompt Vault
 
-Prompt Vault is a file-first prompt workspace for composing prompts on a canvas, managing prompt assets, and preserving immutable revision history. The application is a TypeScript full stack: a React browser client, a Hono API on Node.js, and a host-aware command-line client.
+[简体中文](README.zh-CN.md)
+
+Prompt Vault is a self-hosted, file-first workspace for composing prompts, organizing image assets, and preserving prompt experiments as revision lineage.
+
+It combines a React/G6 browser workspace, a Hono API on Node.js, an authenticated CLI, and a portable Agent Skill. The server remains the sole writer of the workspace; browser clients, people, and agents use the same `/api/v2` contract.
+
+## Features
+
+- Compose positive prompts, negative prompts, notes, model names, and generation parameters.
+- Attach ordered reference and result images to an editable Draft.
+- Save immutable Revisions and visualize their parent/child Lineage on a canvas.
+- Continue from, restore, compare, mark, and safely remove Revisions.
+- Keep prompt text and metadata in readable files while storing immutable assets by content hash.
+- Operate one or more Vault Hosts through a revocable, browser-authorized CLI.
+- Give Agent Skills-compatible clients a guarded CLI interaction workflow.
+
+## Quick Start With Docker
+
+Requirements: Docker Engine with Docker Compose.
+
+```bash
+mkdir prompt-vault && cd prompt-vault
+curl -LO https://raw.githubusercontent.com/yabo083/prompt-vault/main/compose.yaml
+docker compose up -d
+```
+
+Prompt Vault generates a strong Host Token on first start. Retrieve it from the persistent data volume:
+
+```bash
+docker compose exec prompt-vault cat /data/.vault-token
+```
+
+Open <http://localhost:8767>, enter the Host Token, and the browser will exchange it for an HTTP-only session cookie.
+
+On Windows PowerShell, download the Compose file with:
+
+```powershell
+New-Item -ItemType Directory prompt-vault
+Set-Location prompt-vault
+Invoke-WebRequest https://raw.githubusercontent.com/yabo083/prompt-vault/main/compose.yaml -OutFile compose.yaml
+docker compose up -d
+docker compose exec prompt-vault cat /data/.vault-token
+```
+
+The named Docker volume contains the workspace, Host Token, and CLI authorization records. Recreating or updating the container does not replace this data.
+
+The default Compose binding accepts connections only from the Docker host. For deliberate LAN exposure, set `PROMPT_VAULT_BIND=0.0.0.0` and protect the connection with a trusted network or HTTPS reverse proxy.
+
+See [Deployment](docs/deployment.md) for upgrades, backups, HTTPS reverse proxies, token rotation, source builds, and systemd installation.
+
+## CLI
+
+Install the standalone client with Node.js 20.20 or newer:
+
+```bash
+npm install --global @miyako-lab/prompt-vault-cli
+```
+
+Authorize it against a Vault Host:
+
+```bash
+prompt-vault --host http://localhost:8767 auth login --name local
+prompt-vault --json --host local theme list
+```
+
+The CLI opens a browser approval page. It never stores the Host Token. Approval creates a separate bearer credential that can be replaced by reauthorizing or revoked with `prompt-vault auth logout`.
+
+Use `--json` for the stable `{ ok, data }` or `{ ok, error }` envelope expected by automation. See the [CLI guide](docs/cli.md) for all commands and the two-step agent authorization flow.
+
+## Agent Skill
+
+The repository ships a portable [Agent Skills](https://agentskills.io/) workflow that teaches agents to authenticate, inspect, mutate, and verify Prompt Vault state through the CLI.
+
+Install it for supported clients, including OpenCode, Claude Code, and Codex:
+
+```bash
+npx skills add yabo083/prompt-vault
+```
+
+The skill uses two-step browser authorization so an agent can return the approval URL and code before waiting for the user. It requires explicit user confirmation for Draft discard, forced replacement, Theme deletion, and permanent Revision deletion.
 
 ## Domain Model
 
-- **Theme** is a prompt project and the unit shown in the workspace.
-- **Draft** is the only mutable prompt state.
-- **Revision** is an immutable snapshot published from a Draft.
-- **Lineage** records which Revision a new Draft continues from.
-- **Asset** is a typed file attached to a Draft or Revision: instruction, reference, result, or supplementary material.
-- **Vault Host** owns a workspace and exposes it through the HTTP API.
+- **Theme** is one prompt exploration and the unit shown in the library.
+- **Draft** is the only mutable creative state of a Theme.
+- **Revision** is an immutable snapshot saved from a Draft.
+- **Lineage** records the parent relationships among Revisions.
+- **Asset** is a reference or result image attached to a Draft or Revision.
+- **Vault Host** owns a workspace and exposes it through the HTTP interface.
 
-Public APIs and the UI use these terms consistently. Existing workspaces are read through a compatibility layer, so migration does not require rewriting stored files.
+Existing legacy workspaces are projected through compatibility reads and are not rewritten merely by being opened.
 
-## Architecture
+## Storage And Security
 
-The main boundaries are:
+The workspace contains ordinary directories, Markdown files, and JSON metadata. Revision assets are copied into a content-addressed `.assets/` store and verified by SHA-256. Multi-file mutations use locks, staging, and atomic replacement.
 
-- `src/core`: application module, filesystem repository, compatibility reads, locking, and atomic publication.
-- `src/server`: Hono HTTP adapter, browser authentication, CLI device authorization, API routes, and static delivery.
-- `src/cli`: `prompt-vault` HTTP client for one or more Vault Hosts.
-- `frontend`: React and G6 workspace client.
+The Host Token grants administrator browser access. Keep it private and use HTTPS whenever traffic leaves a trusted network. CLI credentials are independently revocable and should not be copied between users.
 
-See [Architecture](docs/architecture.md), [CLI](docs/cli.md), and [Deployment](docs/deployment.md) for the operational details.
+Back up the data volume independently from application releases. Application rollback and workspace rollback are separate operations.
 
-## Local Development
+## Development
 
-Requirements: Node.js 20 or newer and npm.
+Requirements: Node.js 20.20 or newer and npm.
 
 ```bash
+git clone https://github.com/yabo083/prompt-vault.git
+cd prompt-vault
 npm ci
-```
-
-Run the API and Vite client in separate terminals:
-
-```bash
 npm run dev:server
-npm run dev
 ```
 
-The API listens on `http://127.0.0.1:8768` and Vite serves the browser client on its displayed development URL. The API creates a random host token in `.vault-token` unless `PROMPT_VAULT_TOKEN` is set.
-
-Useful commands:
+Run `npm run dev` in another terminal for the Vite client. The development API listens on `http://127.0.0.1:8768` by default.
 
 ```bash
 npm test
 npm run typecheck
 npm run build
-npm start
 ```
 
-`npm run dev:server` starts the Node API and `npm run dev` starts Vite with an API proxy. Restart the API process after server-side edits. `npm run build` produces the browser bundle in `static/dist` and Node output in `dist`.
-
-## Configuration
-
-The server reads:
-
-| Variable | Purpose | Default |
-| --- | --- | --- |
-| `PROMPT_VAULT_TOKEN` | Browser sign-in token | generated in `.vault-token` |
-| `PROMPT_VAULT_TOKEN_FILE` | Generated host token file | `./.vault-token` |
-| `PROMPT_VAULT_WORKSPACE` | Workspace directory | `./workspace` |
-| `HOST` | Listen address | `127.0.0.1` |
-| `PORT` | Listen port | `8768` |
-
-Browser sign-in exchanges the host token for an HTTP-only `prompt_vault_token` cookie; the token is not stored in browser JavaScript storage. Cookie-authenticated writes also require a same-origin request. CLI bearer tokens are issued by the browser approval flow and are stored in the user's Prompt Vault configuration directory.
-
-## Storage
-
-The workspace remains ordinary files and directories. Prompt content and metadata are human-readable, while binary assets are content-addressed for immutable Revisions. Mutations use workspace locks and atomic filesystem operations. Read-only queries do not write into the workspace.
-
-Back up the workspace directory independently of the application installation. A deployment can replace the application without replacing workspace data.
-
-## Deployment
-
-The repository includes a systemd unit at `deploy/prompt-vault.service`. Production runs:
-
-```text
-/usr/bin/node /root/prompt-vault/dist/server/index.js
-```
-
-Build and validate before deploying. Keep the workspace outside the release replacement path or explicitly exclude it from synchronization. The current production procedure and rollback checks are documented in [Deployment](docs/deployment.md).
-
-## Agent And CLI Support
-
-The `prompt-vault` CLI is the supported automation boundary. It uses the same authenticated `/api/v2` contract as the browser and can inspect and mutate Themes, Drafts, Assets, Revisions, and Lineage without direct filesystem access. CLI authorization requires an interactive browser approval, and the resulting bearer credential is revocable.
-
-An agent can operate a Vault Host through this CLI after authorization. Agents should inspect `capabilities`, `statistics`, and `workspace synchronize` before mutations, preserve unsaved Draft work unless explicitly instructed to force a replacement, and treat Theme deletion as a recoverable move to the host trash.
-
-The repository does not yet ship a portable agent skill. The current local development playbook is intentionally environment-specific and is not part of the public distribution.
+Architecture, deployment, and CLI contracts are documented under [`docs/`](docs/architecture.md).
 
 ## Roadmap
 
-1. Improve Revision comparison: provide a denser, clearer comparison workspace for text, metadata, asset ordering, and visual output changes.
-2. Improve share cards: define an open `PVP` image format for a standalone photo that preserves prompt and generation parameters while remaining resilient to common recompression and incidental image processing.
+1. **Revision comparison**: improve the comparison workspace for prompt text, metadata, asset ordering, and visual output changes.
+2. **PVP share images**: define an open Prompt Vault Picture format consisting of a clean standalone photo plus embedded prompt and generation metadata designed to survive common recompression and incidental image processing.
+
+## License
+
+Prompt Vault is licensed under the [GNU General Public License v3.0 or later](LICENSE).

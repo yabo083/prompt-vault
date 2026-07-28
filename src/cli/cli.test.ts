@@ -16,7 +16,7 @@ import { addMalformedTheme, copyLegacyWorkspace } from "../test/workspace.js";
 const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64");
 
 async function runCli(args: string[], env: Record<string, string>) {
-  const child = spawn(process.execPath, ["dist/cli/index.js", ...args], {
+  const child = spawn(process.execPath, ["packages/cli/dist/index.js", ...args], {
     cwd: process.cwd(),
     env: { ...process.env, ...env },
     stdio: ["ignore", "pipe", "pipe"],
@@ -46,6 +46,12 @@ async function waitForPendingRequests(host: string, token: string, count: number
 }
 
 describe("prompt-vault CLI process", () => {
+  it("reports the published CLI version", async () => {
+    const result = await runCli(["--version"], {});
+    const manifest = JSON.parse(await readFile(join(process.cwd(), "packages/cli/package.json"), "utf8")) as { version: string };
+    expect(result).toMatchObject({ code: 0, stdout: `${manifest.version}\n`, stderr: "" });
+  });
+
   it("returns parser failures through the JSON error contract", async () => {
     const result = await runCli(["--json", "theme", "show"], {});
 
@@ -79,8 +85,8 @@ describe("prompt-vault CLI process", () => {
 
     try {
       const result = await runCli(
-        ["--json", "auth", "login", "--host", `http://127.0.0.1:${address.port}`, "--name", "hostile"],
-        { PROMPT_VAULT_CONFIG_DIR: join(tmpdir(), `prompt-vault-hostile-${Date.now()}`), PROMPT_VAULT_NO_BROWSER: "1" },
+        ["--json", "auth", "login", "--host", `http://127.0.0.1:${address.port}`, "--name", "hostile", "--no-browser"],
+        { PROMPT_VAULT_CONFIG_DIR: join(tmpdir(), `prompt-vault-hostile-${Date.now()}`) },
       );
       expect(result.code).toBe(3);
       expect(JSON.parse(result.stdout)).toMatchObject({ ok: false, error: { code: "INVALID_VERIFICATION_URI" } });
@@ -108,11 +114,10 @@ describe("prompt-vault CLI process", () => {
     const env = {
       PROMPT_VAULT_CONFIG_DIR: configDirectory,
       PROMPT_VAULT_CREDENTIAL_STORE: "file",
-      PROMPT_VAULT_NO_BROWSER: "1",
     };
 
     try {
-      const login = runCli(["--json", "auth", "login", "--host", host, "--name", "test"], env);
+      const login = runCli(["--json", "auth", "login", "--host", host, "--name", "test", "--no-browser"], env);
       const pending = await waitForPendingRequest(host, "host-token");
       const approval = await fetch(`${host}/api/v2/auth/device/${pending.requestId}/approve`, {
         method: "POST",
@@ -125,6 +130,26 @@ describe("prompt-vault CLI process", () => {
       expect(loggedIn.stderr).toContain(`Open ${host}/auth/cli/`);
       expect(loggedIn.stderr).toContain(`Code: ${pending.userCode}`);
       expect(loggedIn.stdout).not.toContain("pv_");
+
+      const requested = await runCli(["--json", "--host", host, "auth", "request", "--name", "test"], env);
+      const requestPayload = JSON.parse(requested.stdout).data;
+      expect(requestPayload).toMatchObject({ host: "test", url: host, userCode: expect.stringMatching(/^[A-Z0-9]{8}$/) });
+      expect(requestPayload).not.toHaveProperty("token");
+      const pendingCompletion = await runCli([
+        "--json", "--host", host, "auth", "complete", "--name", "test", "--request", requestPayload.requestId,
+      ], env);
+      expect(JSON.parse(pendingCompletion.stdout)).toEqual({ ok: true, data: { status: "pending", host: "test", url: host } });
+      expect((await fetch(`${host}/api/v2/auth/device/${requestPayload.requestId}/approve`, {
+        method: "POST",
+        headers: { Authorization: "Bearer host-token", "Content-Type": "application/json" },
+        body: JSON.stringify({ userCode: requestPayload.userCode }),
+      })).status).toBe(204);
+      const completed = await runCli([
+        "--json", "--host", host, "auth", "complete", "--name", "test", "--request", requestPayload.requestId,
+      ], env);
+      expect(JSON.parse(completed.stdout)).toMatchObject({ ok: true, data: { status: "approved", host: "test", url: host, authenticated: true } });
+      expect(completed.stdout).not.toContain("pv_");
+      expect((await fetch(`${host}/api/v2/auth/device/${requestPayload.requestId}`)).status).toBe(404);
 
       const status = await runCli(["--json", "auth", "status", "--host", "test"], env);
       expect(JSON.parse(status.stdout)).toMatchObject({
@@ -248,7 +273,7 @@ describe("prompt-vault CLI process", () => {
         data: [{ name: "test", url: host, current: true, authenticated: true }],
       });
 
-      const relogin = runCli(["--json", "auth", "login", "--host", host, "--name", "test"], env);
+      const relogin = runCli(["--json", "auth", "login", "--host", host, "--name", "test", "--no-browser"], env);
       const replacement = await waitForPendingRequest(host, "host-token");
       expect((await fetch(`${host}/api/v2/auth/device/${replacement.requestId}/approve`, {
         method: "POST",
@@ -262,7 +287,7 @@ describe("prompt-vault CLI process", () => {
       expect(await credentials.json()).toHaveLength(1);
 
       const concurrentLogins = ["alpha", "beta"].map((name) => runCli(
-        ["--json", "auth", "login", "--host", host, "--name", name],
+        ["--json", "auth", "login", "--host", host, "--name", name, "--no-browser"],
         env,
       ));
       const concurrentRequests = await waitForPendingRequests(host, "host-token", 2);
@@ -279,7 +304,7 @@ describe("prompt-vault CLI process", () => {
 
       const blockedConfig = join(directory, "blocked-config");
       await writeFile(blockedConfig, "not a directory", "utf8");
-      const failedLogin = runCli(["--json", "auth", "login", "--host", host, "--name", "unsaved"], {
+      const failedLogin = runCli(["--json", "auth", "login", "--host", host, "--name", "unsaved", "--no-browser"], {
         ...env,
         PROMPT_VAULT_CONFIG_DIR: blockedConfig,
       });
@@ -290,9 +315,10 @@ describe("prompt-vault CLI process", () => {
         body: JSON.stringify({ userCode: unsavedRequest.userCode }),
       })).status).toBe(204);
       const failedLoginResult = await failedLogin;
-      expect(failedLoginResult.code).toBe(1);
+      expect(failedLoginResult.code).toBe(4);
       expect(failedLoginResult.stderr).toContain(`Open ${host}/auth/cli/`);
-      expect(JSON.parse(failedLoginResult.stdout)).toMatchObject({ ok: false });
+      expect(JSON.parse(failedLoginResult.stdout)).toMatchObject({ ok: false, error: { code: "CREDENTIAL_SAVE_FAILED_REVOKED" } });
+      expect((await fetch(`${host}/api/v2/auth/device/${unsavedRequest.requestId}`)).status).toBe(404);
       const credentialsAfterFailedLogin = await fetch(`${host}/api/v2/auth/credentials`, {
         headers: { Authorization: "Bearer host-token" },
       });

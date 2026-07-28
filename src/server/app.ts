@@ -181,10 +181,12 @@ export function createHttpApp({
   const app = new Hono<{ Variables: { identity: Identity } }>();
   const deviceAttempts = new Map<string, number[]>();
 
+  app.get("/healthz", (context) => context.json({ status: "ok" }));
+
   app.use("/api/v2/*", async (context, next) => {
     const path = context.req.path;
     const publicDeviceRequest = path === "/api/v2/auth/device" && context.req.method === "POST";
-    const publicDevicePoll = /^\/api\/v2\/auth\/device\/[^/]+$/.test(path) && context.req.method === "GET";
+    const publicDevicePoll = /^\/api\/v2\/auth\/device\/[^/]+$/.test(path) && new Set(["GET", "DELETE"]).has(context.req.method);
     const publicBrowserLogin = path === "/api/v2/auth/browser" && context.req.method === "POST";
     if (publicDeviceRequest || publicDevicePoll || publicBrowserLogin) return next();
     if (token || authorization) {
@@ -299,6 +301,13 @@ export function createHttpApp({
     if (state.status === "pending") return context.json(state, 202);
     if (state.status === "expired") return context.json(state, 410);
     return context.json(state);
+  });
+
+  app.delete("/api/v2/auth/device/:requestId", async (context) => {
+    if (!authorization) return context.json({ error: { code: "NOT_SUPPORTED", message: "CLI authorization is not configured" } }, 501);
+    await authorization.discardDeviceRequest(context.req.param("requestId"));
+    context.header("Cache-Control", "no-store");
+    return context.body(null, 204);
   });
 
   app.get("/api/v2/auth/requests", async (context) => {

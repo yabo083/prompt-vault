@@ -1,0 +1,13 @@
+name: prompt-vault
+
+services:
+  prompt-vault:
+    image: ghcr.io/yabo083/prompt-vault:${PROMPT_VAULT_VERSION:-latest}
+    restart: unless-stopped
+    ports:
+      - "${PROMPT_VAULT_BIND:-127.0.0.1}:${PROMPT_VAULT_PORT:-8767}:8767"
+    volumes:
+      - prompt-vault-data:/data
+
+volumes:
+  prompt-vault-data:

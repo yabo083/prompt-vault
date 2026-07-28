@@ -1,106 +1,138 @@
 # Command-Line Client
 
-The `prompt-vault` CLI uses a Vault Host's `/api/v2` API. It never reads or writes a workspace directory directly.
+The `prompt-vault` CLI operates Vault Hosts through `/api/v2`. It never reads or writes a server workspace directly.
 
-## Build And Run
+## Install
+
+Node.js 20.20 or newer is required.
 
 ```bash
-npm run build
-node dist/cli/index.js --help
+npm install --global @miyako-lab/prompt-vault-cli
+prompt-vault --version
 ```
 
-The installed executable name is `prompt-vault`. Pass `--json` for a stable machine-readable envelope and `--host <name-or-url>` to override the active host.
+To build the CLI from source:
+
+```bash
+npm ci
+npm run build:cli
+node packages/cli/dist/index.js --help
+```
+
+Use `--json` for a stable machine-readable envelope and `--host <name-or-url>` to select a configured Vault Host explicitly.
 
 ## Browser Authorization
 
-Authorize a host and store it under a local name:
+For an interactive terminal, start the complete device flow:
 
 ```bash
-prompt-vault --host http://192.168.0.107:8767 auth login --name home
+prompt-vault --host https://vault.example.com auth login --name home
 ```
 
-The CLI opens the host's approval page and prints its short user code. Sign into the host in the browser and approve the request. The resulting bearer token is stored only in the user's local Prompt Vault CLI configuration.
+The CLI opens the Vault Host's approval page and prints a short code. Sign in to the Vault Host with its Host Token, then approve the CLI request. The resulting CLI credential is stored in the operating system keyring on macOS and Windows, or in a mode-`0600` configuration file on Linux.
+
+The Host Token is never copied into CLI configuration.
+
+### Agent Authorization
+
+Agents whose shell tools do not stream a running process should use the non-blocking two-step flow:
+
+```bash
+prompt-vault --json --host https://vault.example.com auth request --name home
+```
+
+The response contains `verificationUri`, `userCode`, and `requestId`, but no credential. After the user approves in a browser:
+
+```bash
+prompt-vault --json --host https://vault.example.com auth complete --name home --request <requestId>
+```
+
+A pending approval returns `data.status: "pending"`. A successful completion returns `data.status: "approved"` and stores the CLI credential.
 
 Manage connections with:
 
 ```bash
-prompt-vault host list
-prompt-vault host use home
-prompt-vault auth status
-prompt-vault auth logout
+prompt-vault --json host list
+prompt-vault --json host use home
+prompt-vault --json --host home auth status
+prompt-vault --json --host home auth logout
 ```
 
-Re-authenticating revokes the previous credential when the host is reachable. Logout revokes the server credential before deleting the local entry.
+Reauthorizing a host revokes the previous credential when the host is reachable. Logout revokes the server credential before deleting the local copy.
+
+## JSON Contract
+
+Successful commands emit:
+
+```json
+{"ok":true,"data":{}}
+```
+
+Failures emit a non-zero exit code and:
+
+```json
+{"ok":false,"error":{"code":"AUTH_REQUIRED","message":"..."}}
+```
+
+Automation should branch on `error.code` and report `error.message` without rewriting it.
 
 ## Themes And Drafts
 
 ```bash
-prompt-vault theme list --query "portrait"
-prompt-vault theme show <slug>
-prompt-vault theme create --title "Release portrait" --tag editorial
-prompt-vault theme duplicate <slug>
-prompt-vault theme delete <slug>
+prompt-vault --json --host home theme list --query "portrait"
+prompt-vault --json --host home theme show <slug>
+prompt-vault --json --host home theme create --title "Release portrait" --tag editorial
+prompt-vault --json --host home theme duplicate <slug>
+prompt-vault --json --host home theme delete <slug>
+prompt-vault --json --host home draft update <slug> --prompt "..." --model "..."
+prompt-vault --json --host home draft discard <slug>
 ```
 
-Create accepts the same Draft fields as update. Run `prompt-vault theme create --help` for title, description, category, tags, prompt, negative prompt, notes, model, parameters, reference URLs, favorite state, and archive state.
+Create and update support title, description, category, tags, prompt, negative prompt, notes, model, parameters, reference URLs, favorite state, and archive state. Run the command with `--help` for exact options.
 
-```bash
-prompt-vault draft update <slug> --prompt "..." --model "..."
-prompt-vault draft update <slug> --clear-tags --clear-reference-urls
-prompt-vault draft discard <slug>
-```
-
-Discard restores the Draft from its Base Revision.
+Theme deletion moves the Theme into server-side trash. Draft discard replaces unsaved creative state with the Base Revision and should be treated as destructive.
 
 ## Assets
 
-Draft image Assets are either `reference` or `result`:
-
 ```bash
-prompt-vault asset add <slug> reference ./input.png ./guide.jpg
-prompt-vault asset reorder <slug> reference input.png guide.jpg
-prompt-vault asset remove <slug> reference guide.jpg
-prompt-vault asset get <slug> result output.png --output ./downloaded.png
-prompt-vault asset get <slug> result output.png --revision 2
+prompt-vault --json --host home asset add <slug> reference ./input.png ./guide.jpg
+prompt-vault --json --host home asset reorder <slug> reference input.png guide.jpg
+prompt-vault --json --host home asset remove <slug> reference guide.jpg
+prompt-vault --json --host home asset get <slug> result output.png --output ./downloaded.png
+prompt-vault --json --host home asset get <slug> result output.png --revision 2 --output ./revision.png
 ```
 
 ## Revisions And Lineage
 
 ```bash
-prompt-vault revision save <slug> --note "Initial direction"
-prompt-vault revision show <slug> 1
-prompt-vault revision continue <slug> 1
-prompt-vault revision restore <slug> 1 --force
-prompt-vault revision compare <slug> 1 2
-prompt-vault lineage show <slug>
+prompt-vault --json --host home revision save <slug> --note "Initial direction"
+prompt-vault --json --host home revision show <slug> 1
+prompt-vault --json --host home revision continue <slug> 1
+prompt-vault --json --host home revision restore <slug> 1 --force
+prompt-vault --json --host home revision compare <slug> 1 2
+prompt-vault --json --host home revision mark <slug> 2 --featured true --favorite true
+prompt-vault --json --host home revision delete <slug> 2
+prompt-vault --json --host home lineage show <slug>
 ```
 
-`continue` starts a new Draft whose parent is the selected Revision. `restore` copies Revision content into the current Draft without changing its lineage base. Both protect unsaved Draft work unless `--force` is passed.
+Continue changes the Draft's Base Revision. Restore copies historical content into the existing Draft without changing its lineage base. Both protect unsaved Draft work unless `--force` is explicitly passed.
 
-Revision marks and deletion are external to immutable snapshot content:
-
-```bash
-prompt-vault revision mark <slug> 2 --featured true --favorite true
-prompt-vault revision mark <slug> 2 --hidden false
-prompt-vault revision delete <slug> 2
-```
-
-Only a leaf Revision can be deleted. `--force` is required when deleting the current Draft's Base Revision with unsaved changes.
+Only a leaf Revision can be deleted. Revision deletion is permanent.
 
 ## Host Operations
 
 ```bash
-prompt-vault capabilities
-prompt-vault statistics
-prompt-vault export
-prompt-vault workspace synchronize
+prompt-vault --json --host home capabilities
+prompt-vault --json --host home statistics
+prompt-vault --json --host home export
+prompt-vault --json --host home workspace synchronize
 ```
 
-`export` emits the current Vault projection as JSON. `workspace synchronize` scans Themes for unsaved Drafts and invalid workspace state; it is a validation/synchronization command, not a direct client-side file scan.
+`workspace synchronize` scans Themes for unsaved Drafts and malformed workspace state. It does not perform a client-side filesystem scan.
 
 ## Security
 
-- Never put the browser shared token in CLI configuration.
-- Do not share CLI configuration files because they contain bearer tokens.
 - Use HTTPS when the Vault Host crosses an untrusted network.
-- Device approval codes are short-lived and single-purpose.
+- Never request, store, or pass the Host Token to the CLI.
+- Do not share CLI configuration or keyring entries between users.
+- Revoke temporary agent credentials with `auth logout` when the task ends.
